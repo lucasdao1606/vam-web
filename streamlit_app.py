@@ -6,6 +6,7 @@ Chạy: streamlit run streamlit_app.py
 """
 
 import json
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -48,45 +49,53 @@ if "log" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp VNDirect API - Lấy giá hiện tại & MA200 cho VN-Index
+# Tích hợp TCBS API - Lấy giá hiện tại & MA200 cho VN-Index
 # ---------------------------------------------------------------------------
 def fetch_vnindex_yfinance() -> tuple[float, float]:
-    """Tải dữ liệu VN-Index từ VNDirect API (thay thế yfinance để tránh bị Cloud IP chặn)"""
-    url = "https://finfo-api.vndirect.com.vn/v4/stock_prices?sort=date&q=code:VNINDEX&size=300"
-    req = urllib.request.Request(
-        url, 
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    )
+    """Tải dữ liệu VN-Index từ TCBS API (Tránh timeout và chặn IP trên Cloud)"""
+    end_time = int(time.time())
+    start_time = end_time - (365 * 86400)  # Lấy dữ liệu 1 năm trước
     
+    url = f"https://tcbs-active-api.tcbs.com.vn/rat/v1/stock/bars?ticker=VNINDEX&type=stock&resolution=1D&from={start_time}&to={end_time}"
+    url_alt = f"https://kライン-api.tcbs.com.vn/rat/v1/stock/bars?ticker=VNINDEX&type=stock&resolution=1D&from={start_time}&to={end_time}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            res = json.loads(response.read().decode("utf-8"))
-            data = res.get("data", [])
-            
+        data = None
+        for target_url in [url, url_alt]:
+            try:
+                req = urllib.request.Request(target_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    res = json.loads(response.read().decode("utf-8"))
+                    if "data" in res and res["data"]:
+                        data = res["data"]
+                        break
+            except Exception:
+                continue
+
         if not data:
-            raise Exception("Không nhận được dữ liệu từ API VNDirect.")
-            
+            raise Exception("Không thể kết nối đến máy chủ dữ liệu TCBS.")
+
         df = pd.DataFrame(data)
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.sort_values("date").reset_index(drop=True)
-            
-        close_col = "close" if "close" in df.columns else ("adClose" if "adClose" in df.columns else None)
-        if not close_col:
-            raise Exception("Không tìm thấy cột giá đóng cửa trong dữ liệu.")
-            
-        close_series = df[close_col].dropna().astype(float)
-        
+        if "close" not in df.columns:
+            raise Exception("Không tìm thấy dữ liệu giá đóng cửa.")
+
+        close_series = df["close"].dropna().astype(float)
+
         if len(close_series) < 200:
             raise Exception(f"Dữ liệu chỉ có {len(close_series)} phiên, không đủ 200 phiên để tính MA200.")
-            
+
         price_current = float(close_series.iloc[-1])
         ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
-        
+
         return round(price_current, 2), round(ma200, 2)
-        
+
     except Exception as e:
-        raise Exception(f"Lỗi kết nối API VNDirect: {str(e)}")
+        raise Exception(f"Lỗi lấy dữ liệu VN-Index: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +250,7 @@ with st.sidebar.expander("⚖️ Trọng số 4 thành phần (%)", expanded=Tru
 
 with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
     if st.button("📈 Lấy giá & MA200 tự động", use_container_width=True):
-        with st.spinner("Đang tải dữ liệu VN-Index từ API..."):
+        with st.spinner("Đang tải dữ liệu VN-Index từ TCBS API..."):
             try:
                 p_curr, ma_val = fetch_vnindex_yfinance()
                 st.session_state.price_current = p_curr
