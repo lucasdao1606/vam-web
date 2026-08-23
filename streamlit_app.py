@@ -49,42 +49,29 @@ if "log" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp TCBS API - Lấy giá hiện tại & MA200 cho VN-Index
+# Tích hợp DNSE API - Lấy giá hiện tại & MA200 cho VN-Index (Hoạt động tốt trên Cloud)
 # ---------------------------------------------------------------------------
 def fetch_vnindex_yfinance() -> tuple[float, float]:
-    """Tải dữ liệu VN-Index từ TCBS API (Tránh timeout và chặn IP trên Cloud)"""
+    """Tải dữ liệu VN-Index từ DNSE API (Khắc phục triệt để lỗi bị chặn IP trên Cloud)"""
     end_time = int(time.time())
-    start_time = end_time - (365 * 86400)  # Lấy dữ liệu 1 năm trước
-    
-    url = f"https://tcbs-active-api.tcbs.com.vn/rat/v1/stock/bars?ticker=VNINDEX&type=stock&resolution=1D&from={start_time}&to={end_time}"
-    url_alt = f"https://kライン-api.tcbs.com.vn/rat/v1/stock/bars?ticker=VNINDEX&type=stock&resolution=1D&from={start_time}&to={end_time}"
+    start_time = end_time - (365 * 86400)  # Lấy dữ liệu 1 năm gần nhất
 
+    url = f"https://services.entrade.com.vn/chart-api/v2/ohlc/stock?from={start_time}&to={end_time}&symbol=VNINDEX&resolution=1D"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json",
     }
 
     try:
-        data = None
-        for target_url in [url, url_alt]:
-            try:
-                req = urllib.request.Request(target_url, headers=headers)
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    res = json.loads(response.read().decode("utf-8"))
-                    if "data" in res and res["data"]:
-                        data = res["data"]
-                        break
-            except Exception:
-                continue
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=12) as response:
+            res = json.loads(response.read().decode("utf-8"))
 
-        if not data:
-            raise Exception("Không thể kết nối đến máy chủ dữ liệu TCBS.")
+        close_list = res.get("c", [])  # 'c' chứa danh sách giá đóng cửa trong JSON của DNSE
+        if not close_list:
+            raise Exception("Không nhận được dữ liệu chuỗi giá từ DNSE API.")
 
-        df = pd.DataFrame(data)
-        if "close" not in df.columns:
-            raise Exception("Không tìm thấy dữ liệu giá đóng cửa.")
-
-        close_series = df["close"].dropna().astype(float)
+        close_series = pd.Series(close_list).dropna().astype(float)
 
         if len(close_series) < 200:
             raise Exception(f"Dữ liệu chỉ có {len(close_series)} phiên, không đủ 200 phiên để tính MA200.")
@@ -95,7 +82,7 @@ def fetch_vnindex_yfinance() -> tuple[float, float]:
         return round(price_current, 2), round(ma200, 2)
 
     except Exception as e:
-        raise Exception(f"Lỗi lấy dữ liệu VN-Index: {str(e)}")
+        raise Exception(f"Lỗi lấy dữ liệu từ DNSE API: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +237,7 @@ with st.sidebar.expander("⚖️ Trọng số 4 thành phần (%)", expanded=Tru
 
 with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
     if st.button("📈 Lấy giá & MA200 tự động", use_container_width=True):
-        with st.spinner("Đang tải dữ liệu VN-Index từ TCBS API..."):
+        with st.spinner("Đang tải dữ liệu VN-Index từ DNSE API..."):
             try:
                 p_curr, ma_val = fetch_vnindex_yfinance()
                 st.session_state.price_current = p_curr
