@@ -50,21 +50,18 @@ if "log" not in st.session_state:
 # Tích hợp Dữ liệu VN-Index từ DNSE API
 # ---------------------------------------------------------------------------
 def fetch_vnindex_yfinance() -> tuple[float, float]:
-    """
-    Tải lịch sử VN-Index từ DNSE Chart API v2.
-    """
+    """Tải lịch sử VN-Index từ DNSE Chart API v2."""
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - (3 * 365 * 24 * 3600 * 1000)
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://mkt.dnse.com.vn",
         "Referer": "https://mkt.dnse.com.vn/",
     }
 
     close_prices = []
-
     try:
         dnse_url = f"https://services.entrade.com.vn/chart-api/v2/ohlc/stock?from={start_ms}&to={now_ms}&symbol=VNINDEX&resolution=1D"
         req = urllib.request.Request(dnse_url, headers=headers)
@@ -78,45 +75,35 @@ def fetch_vnindex_yfinance() -> tuple[float, float]:
     if close_prices:
         close_series = pd.Series(close_prices).dropna().reset_index(drop=True)
         total_samples = len(close_series)
-        
         if total_samples > 0:
             price_current = float(close_series.iloc[-1])
-            
-            if total_samples >= 200:
-                ma_val = float(close_series.iloc[-200:].mean())
-            else:
-                ma_val = float(close_series.mean())
-                
+            ma_val = float(close_series.iloc[-200:].mean()) if total_samples >= 200 else float(close_series.mean())
             return round(price_current, 2), round(ma_val, 2)
 
     return float(st.session_state.price_current), float(st.session_state.ma200)
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp Google Gemini AI
+# Tích hợp Google Gemini AI (Xử lý Quota 429 & Retry)
 # ---------------------------------------------------------------------------
 GEMINI_FIELDS = [
     "pe_current", "pb_current", "rf", "dy_current",
     "price_current", "ma200", "volatility_current", "drawdown_pct",
 ]
 
-
 def get_available_gemini_model(encoded_key: str) -> str:
-    """Kiểm tra danh sách mô hình hỗ trợ generateContent khả dụng từ API Key."""
+    """Tự động kiểm tra danh sách Model Gemini khả dụng."""
     list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={encoded_key}"
     req = urllib.request.Request(list_url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
             res = json.loads(response.read().decode("utf-8"))
             models = res.get("models", [])
-            
-            # Ưu tiên mô hình gemini-3.6-flash mới nhất
             priority_targets = [
-                "gemini-3.6-flash",
-                "gemini-3.5-flash",
-                "gemini-3.0-flash",
+                "gemini-2.5-flash",
                 "gemini-2.0-flash",
-                "gemini-1.5-flash"
+                "gemini-1.5-flash",
+                "gemini-2.5-pro"
             ]
             for target in priority_targets:
                 for m in models:
@@ -124,17 +111,12 @@ def get_available_gemini_model(encoded_key: str) -> str:
                     supported = m.get("supportedGenerationMethods", [])
                     if "generateContent" in supported and target in name:
                         return name.replace("models/", "")
-                        
             for m in models:
                 if "generateContent" in m.get("supportedGenerationMethods", []):
                     return m.get("name", "").replace("models/", "")
-    except urllib.error.HTTPError as err:
-        err_body = err.read().decode("utf-8", errors="ignore")
-        raise Exception(f"Lỗi kiểm tra API Key ({err.code}): {err.reason}\n{err_body}")
-    except Exception as exc:
-        raise Exception(f"Không thể lấy danh sách Model Gemini: {exc}")
-        
-    return "gemini-3.6-flash"
+    except Exception:
+        pass
+    return "gemini-2.5-flash"
 
 
 def fetch_market_data_via_gemini(api_key: str) -> dict:
@@ -146,64 +128,64 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={encoded_key}"
 
     prompt = f"""
-    Sử dụng Google Search để tra cứu dữ liệu mới nhất về Thị trường Chứng khoán Việt Nam (VN-Index) và Lợi suất Trái phiếu Chính phủ.
+    Hãy cung cấp ước tính thông số thực tế mới nhất của thị trường chứng khoán Việt Nam (VN-Index):
+    - Dữ liệu giá hiện tại: {dnse_price}
+    - Dữ liệu MA200: {dnse_ma200}
 
-    Dữ liệu giao dịch kỹ thuật cơ sở:
-    - Giá VN-Index hiện tại: {dnse_price}
-    - Đường MA200: {dnse_ma200}
-
-    Trả về duy nhất MỘT CHUỖI JSON thuần túy (không chứa thêm bất kỳ từ ngữ hay cú pháp mã markdown nào) có dạng:
+    Bắt buộc trả về ĐÚNG MỘT CHUỖI JSON thuần túy (không chứa ký tự markdown ```json) dạng:
     {{
         "pe_current": float (P/E hiện tại của VN-Index),
         "pb_current": float (P/B hiện tại của VN-Index),
-        "rf": float (Lợi suất Trái phiếu Chính phủ Việt Nam 10 năm - %),
-        "dy_current": float (Tỷ suất cổ tức Dividend Yield hiện tại - %),
+        "rf": float (Lợi suất TPCP 10 năm - %),
+        "dy_current": float (Dividend Yield - %),
         "price_current": {dnse_price},
         "ma200": {dnse_ma200},
-        "volatility_current": float (Biến động Volatility niên hóa hiện tại - %),
-        "drawdown_pct": float (Mức sụt giảm Drawdown từ đỉnh gần nhất - %)
+        "volatility_current": float (Biến động Volatility - %),
+        "drawdown_pct": float (Drawdown từ đỉnh - %)
     }}
+    Chỉ trả về JSON thuần túy.
     """
 
+    # Payload tiêu chuẩn không gắn Google Search Tool nặng nề để tiết kiệm Quota
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {
-            "temperature": 0.1
-        }
+        "generationConfig": {"temperature": 0.1}
     }
-    
+
     data_bytes = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data_bytes, headers={"Content-Type": "application/json"}, method="POST"
-    )
     
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            res_data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        err_body = err.read().decode("utf-8", errors="ignore")
-        raise Exception(f"Lỗi gọi Gemini API ({err.code}): {err.reason}\n{err_body}")
+    # Cơ chế Retry khi gặp lỗi 429
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(
+                url, data=data_bytes, headers={"Content-Type": "application/json"}, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=25) as response:
+                res_data = json.loads(response.read().decode("utf-8"))
+                
+            candidates = res_data.get("candidates", [])
+            if not candidates:
+                raise Exception("Gemini AI không phản hồi dữ liệu.")
+                
+            parts = candidates[0].get("content", {}).get("parts", [])
+            text_response = "".join([p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]).strip()
 
-    candidates = res_data.get("candidates", [])
-    if not candidates:
-        raise Exception("Gemini AI không phản hồi dữ liệu.")
-        
-    parts = candidates[0].get("content", {}).get("parts", [])
-    
-    text_response = ""
-    for part in parts:
-        if isinstance(part, dict) and "text" in part:
-            text_response += part["text"]
+            if "{" in text_response and "}" in text_response:
+                text_response = text_response[text_response.find("{"):text_response.rfind("}") + 1]
+
+            return json.loads(text_response)
+
+        except urllib.error.HTTPError as err:
+            if err.code == 429:
+                if attempt < max_retries - 1:
+                    time.sleep(3 * (attempt + 1))  # Chờ 3s, 6s trước khi thử lại
+                    continue
+                raise Exception("Hạn mức Gemini API Free hiện đã đầy (Rate Limit 429). Vui lòng đợi 1 phút rồi bấm thử lại!")
+            err_body = err.read().decode("utf-8", errors="ignore")
+            raise Exception(f"Lỗi gọi Gemini API ({err.code}): {err.reason}\n{err_body}")
             
-    text_response = text_response.strip()
-
-    if "{" in text_response and "}" in text_response:
-        start_idx = text_response.find("{")
-        end_idx = text_response.rfind("}") + 1
-        text_response = text_response[start_idx:end_idx]
-
-    return json.loads(text_response)
+    raise Exception("Không thể kết nối Gemini API.")
 
 
 # ---------------------------------------------------------------------------
@@ -214,13 +196,13 @@ st.sidebar.title("⚙️ Thông số đầu vào")
 with st.sidebar.expander("🤖 Google Gemini AI Auto-Fill", expanded=False):
     st.session_state.gemini_api_key = st.text_input(
         "Gemini API Key", value=st.session_state.gemini_api_key, type="password",
-        help="Key chỉ lưu trong phiên làm việc hiện tại, không ghi ra máy chủ.",
+        help="Key chỉ lưu trong phiên làm việc hiện tại.",
     )
     if st.button("Tự động lấy dữ liệu AI"):
         if not st.session_state.gemini_api_key:
             st.warning("Vui lòng nhập API Key trước.")
         else:
-            with st.spinner("Đang tra cứu dữ liệu mới nhất bằng Gemini AI & Google Search..."):
+            with st.spinner("Đang kết nối Gemini AI..."):
                 try:
                     data = fetch_market_data_via_gemini(st.session_state.gemini_api_key)
                     updated = 0
@@ -228,10 +210,10 @@ with st.sidebar.expander("🤖 Google Gemini AI Auto-Fill", expanded=False):
                         if k in data and data[k] is not None:
                             st.session_state[k] = float(data[k])
                             updated += 1
-                    st.success(f"Đã cập nhật {updated} thông số từ Gemini AI!")
+                    st.success(f"Đã cập nhật {updated} thông số từ AI!")
                     st.rerun()
                 except Exception as exc:
-                    st.error(f"Lỗi kết nối Gemini API:\n{exc}")
+                    st.error(f"Lỗi AI: {exc}")
 
 with st.sidebar.expander("👤 Thông tin nhà đầu tư", expanded=True):
     st.session_state.age = st.number_input("Tuổi của bạn", 18, 100, st.session_state.age)
