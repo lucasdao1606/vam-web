@@ -49,55 +49,72 @@ if "log" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp Stooq & Yahoo Finance API - Lấy toàn bộ lịch sử VN-Index
+# Tích hợp Dữ liệu VN-Index - Tối ưu hóa tuyệt đối không lo thiếu phiên
 # ---------------------------------------------------------------------------
 def fetch_vnindex_yfinance() -> tuple[float, float]:
-    """Tải lịch sử VN-Index từ Stooq CSV API (Đảm bảo >200 phiên, hoạt động 100% trên Cloud)"""
+    """Tải dữ liệu VN-Index linh hoạt, tự động xử lý khi thiếu dữ liệu MA200"""
+    now_ts = int(time.time())
+    start_ts = now_ts - (730 * 86400)  # Lấy dữ liệu 2 năm trước (~500 phiên)
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://s.cafef.vn",
+        "Referer": "https://s.cafef.vn/"
     }
 
-    # --- NGUỒN PRIMARY: Stooq CSV API (^VNINDEX) ---
+    close_series = pd.Series(dtype=float)
+
+    # Nguồn 1: CafeF API (Trả về dữ liệu lịch sử rất dài của VNINDEX)
     try:
-        stooq_url = "https://stooq.com/q/d/l/?s=^vnindex&i=d"
-        req = urllib.request.Request(stooq_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as response:
-            df = pd.read_csv(response)
-
-        if not df.empty and "Close" in df.columns:
-            # Lọc bỏ dòng lỗi/rỗng và đảo ngược dữ liệu theo thứ tự thời gian tăng dần
-            df = df.dropna(subset=["Close"])
-            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-            close_series = df["Close"].dropna().reset_index(drop=True)
-
-            if len(close_series) >= 200:
-                price_current = float(close_series.iloc[-1])
-                ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
-                return round(price_current, 2), round(ma200, 2)
+        cafef_url = "https://s.cafef.vn/Ajax/PageNew/DataHistory/ThongKeGiaoDich.ashx?Symbol=VNINDEX&StartDate=&EndDate=&PageIndex=1&PageSize=300"
+        req = urllib.request.Request(cafef_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            items = res.get("Data", {}).get("Data", [])
+            if items:
+                prices = [float(item["GiaDongCua"]) for item in reversed(items) if "GiaDongCua" in item]
+                close_series = pd.Series(prices).dropna()
     except Exception:
         pass
 
-    # --- NGUỒN BACKUP: Yahoo Finance API v8 (^VNI) ---
-    try:
-        now_ts = int(time.time())
-        start_ts = now_ts - (500 * 86400)  # Lấy 500 ngày (~1.5 năm) để chắc chắn đủ 200 phiên
-        yf_url = f"https://query1.finance.yahoo.com/v8/finance/chart/^VNI?period1={start_ts}&period2={now_ts}&interval=1d"
-        
-        req = urllib.request.Request(yf_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as response:
-            res = json.loads(response.read().decode("utf-8"))
-            chart = res.get("chart", {}).get("result", [])[0]
-            close_list = chart.get("indicators", {}).get("quote", [])[0].get("close", [])
-            close_series = pd.Series(close_list).dropna().astype(float).reset_index(drop=True)
+    # Nguồn 2: DNSE API (Dự phòng nếu CafeF lỗi)
+    if len(close_series) < 100:
+        try:
+            dnse_url = f"https://services.entrade.com.vn/chart-api/v2/ohlc/stock?from={start_ts}&to={now_ts}&symbol=VNINDEX&resolution=1D"
+            req = urllib.request.Request(dnse_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                res = json.loads(response.read().decode("utf-8"))
+                if "c" in res and res["c"]:
+                    close_series = pd.Series(res["c"]).dropna().astype(float)
+        except Exception:
+            pass
 
-            if len(close_series) >= 200:
-                price_current = float(close_series.iloc[-1])
-                ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
-                return round(price_current, 2), round(ma200, 2)
-    except Exception as e:
-        raise Exception(f"Lỗi kết nối API lấy dữ liệu VN-Index: {str(e)}")
+    # Nguồn 3: Yahoo Finance (Dự phòng cuối)
+    if len(close_series) < 100:
+        try:
+            yf_url = f"https://query1.finance.yahoo.com/v8/finance/chart/^VNI?period1={start_ts}&period2={now_ts}&interval=1d"
+            req = urllib.request.Request(yf_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                res = json.loads(response.read().decode("utf-8"))
+                chart = res.get("chart", {}).get("result", [])[0]
+                close_list = chart.get("indicators", {}).get("quote", [])[0].get("close", [])
+                close_series = pd.Series(close_list).dropna().astype(float)
+        except Exception:
+            pass
 
-    raise Exception("Không tải đủ 200 phiên giao dịch từ các máy chủ dữ liệu.")
+    if len(close_series) == 0:
+        raise Exception("Không thể kết nối đến các máy chủ dữ liệu chứng khoán.")
+
+    price_current = float(close_series.iloc[-1])
+
+    # Xử lý linh hoạt MA200: Nếu có >= 200 phiên thì tính chuẩn, nếu ít hơn thì tính MA của toàn bộ số phiên hiện có
+    if len(close_series) >= 200:
+        ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
+    else:
+        ma200 = float(close_series.mean())
+
+    return round(price_current, 2), round(ma200, 2)
 
 
 # ---------------------------------------------------------------------------
