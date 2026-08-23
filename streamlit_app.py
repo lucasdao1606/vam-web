@@ -12,7 +12,7 @@ import urllib.error
 
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.transforms as mtransforms
+import plotly.graph_objects as go
 import streamlit as st
 
 from vam_core import VAMInputs, compute
@@ -53,39 +53,53 @@ if "log" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Vẽ biểu đồ đĩa 3D chiếu xiên
+# Vẽ biểu đồ phân bổ Donut tương tác bằng Plotly (Hiện đại & Sắc nét)
 # ---------------------------------------------------------------------------
-def draw_3d_pie_chart(weights, labels, colors):
-    """Vẽ biểu đồ đĩa tròn 3D nghiêng góc chiếu xiên bằng Matplotlib Affine Transform."""
-    fig, ax = plt.subplots(figsize=(5, 4.2), subplot_kw=dict(aspect="equal"))
-    
-    wedges, texts, autotexts = ax.pie(
-        weights,
-        labels=labels,
-        autopct="%1.1f%%",
-        startangle=140,
-        colors=colors,
-        explode=(0.08, 0.03, 0.03),
-        pctdistance=0.62,
-        textprops=dict(color="black", weight="bold", fontsize=10),
-        shadow=True
+def draw_plotly_pie_chart(weights, labels, colors):
+    """Tạo biểu đồ đĩa tròn Donut tương tác chuẩn UI FinTech bằng Plotly."""
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=weights,
+                hole=0.48,  # Thiết kế Donut hiện đại
+                marker=dict(
+                    colors=colors,
+                    line=dict(color="#FFFFFF", width=2.5)
+                ),
+                textinfo="label+percent",
+                hoverinfo="label+value+percent",
+                textfont=dict(size=13, family="Arial, sans-serif"),
+                insidetextorientation="horizontal",
+                pull=[0.06, 0, 0],  # Nổi bật phần Cổ phiếu
+            )
+        ]
     )
-    
-    for autotext in autotexts:
-        autotext.set_color("white")
-        autotext.set_fontsize(10)
-        autotext.set_weight("bold")
 
-    # Ép khung hình elip nghiêng 3D
-    tr = mtransforms.Affine2D().scale(1.0, 0.55) + ax.transData
-    for w in wedges:
-        w.set_transform(tr)
-    
-    ax.set_xlim(-1.2, 1.2)
-    ax.set_ylim(-0.7, 0.8)
-    ax.axis("off")
-    fig.patch.set_alpha(0.0)
-    
+    fig.update_layout(
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.15,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=12)
+        ),
+        margin=dict(l=20, r=20, t=20, b=20),
+        height=380,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        annotations=[
+            dict(
+                text="<b>DANH MỤC</b><br>TỔNG THỂ",
+                x=0.5, y=0.5,
+                font_size=12,
+                showarrow=False,
+                align="center"
+            )
+        ]
+    )
     return fig
 
 
@@ -462,18 +476,28 @@ with col1:
         )
 
 with col2:
-    st.subheader("📈 Biểu đồ phân bổ 3D")
+    st.subheader("📈 Biểu đồ tỷ trọng phân bổ")
     if result is None:
-        fig, ax = plt.subplots(figsize=(4.5, 4.5))
-        ax.text(0.5, 0.5, "Chưa có dữ liệu", ha="center", va="center")
-        ax.axis("off")
-        st.pyplot(fig)
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Chưa có dữ liệu tính toán",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        fig.update_layout(
+            height=350,
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)"
+        )
+        st.plotly_chart(fig, use_container_width=True)
     else:
         weights = [result.equity_weight, result.bond_weight, result.gold_weight]
         labels = ["Cổ phiếu", "Trái phiếu", "Vàng"]
-        colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
-        fig = draw_3d_pie_chart(weights, labels, colors)
-        st.pyplot(fig)
+        colors = ["#2563EB", "#F59E0B", "#10B981"]  # Bảng màu FinTech tiêu chuẩn
+        fig = draw_plotly_pie_chart(weights, labels, colors)
+        st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # Đánh giá chi tiết từng tham số đầu vào
