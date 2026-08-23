@@ -49,31 +49,42 @@ if "log" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp yfinance - Lấy giá hiện tại & MA200 cho VN-Index
+# Tích hợp yfinance - Lấy giá hiện tại & MA200 cho VN-Index (Tối ưu Cloud)
 # ---------------------------------------------------------------------------
 def fetch_vnindex_yfinance() -> tuple[float, float]:
     """Tải dữ liệu VN-Index từ Yahoo Finance và tính toán MA200"""
-    ticker = "^VNINDEX"
-    df = yf.download(ticker, period="1y", interval="1d", progress=False)
+    ticker_symbol = "^VNINDEX"
     
-    if df.empty:
-        raise Exception("Không thể lấy dữ liệu từ Yahoo Finance.")
+    try:
+        # Cách 1: Tải thông qua đối tượng Ticker
+        ticker = yf.Ticker(ticker_symbol)
+        df = ticker.history(period="1y", interval="1d")
         
-    # Xử lý trường hợp MultiIndex columns nếu yfinance trả về dạng bảng 2 tầng
-    if isinstance(df.columns, pd.MultiIndex):
-        close_series = df['Close'][ticker]
-    else:
-        close_series = df['Close']
-        
-    close_series = close_series.dropna()
-    
-    if len(close_series) < 200:
-        raise Exception("Dữ liệu lịch sử không đủ 200 phiên để tính MA200.")
-        
-    price_current = float(close_series.iloc[-1])
-    ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
-    
-    return round(price_current, 2), round(ma200, 2)
+        # Cách 2: Trường hợp Ticker trả về rỗng, thử dùng download
+        if df.empty:
+            df = yf.download(ticker_symbol, period="1y", interval="1d", progress=False, ignore_tz=True)
+            
+        if df.empty:
+            raise Exception("Yahoo Finance không phản hồi dữ liệu hoặc IP máy chủ bị giới hạn tạm thời.")
+
+        # Trích xuất cột Close (xử lý cả cấu trúc MultiIndex)
+        if isinstance(df.columns, pd.MultiIndex):
+            close_series = df['Close'][ticker_symbol]
+        else:
+            close_series = df['Close']
+
+        close_series = close_series.dropna()
+
+        if len(close_series) < 200:
+            raise Exception(f"Dữ liệu lịch sử chỉ có {len(close_series)} phiên, không đủ 200 phiên để tính MA200.")
+
+        price_current = float(close_series.iloc[-1])
+        ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
+
+        return round(price_current, 2), round(ma200, 2)
+
+    except Exception as e:
+        raise Exception(f"Lỗi kết nối yfinance: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +257,7 @@ with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
     st.session_state.volatility_avg = st.number_input(
         "Volatility TB lịch sử (%)", 0.0, 200.0, st.session_state.volatility_avg, 0.5
     )
-    # Đảm bảo giá trị luôn nằm trong khoảng 0.0 - 100.0 (lấy giá trị tuyệt đối nếu âm)
+    
     current_drawdown = float(st.session_state.get("drawdown_pct", 0.0))
     current_drawdown = max(0.0, min(100.0, abs(current_drawdown)))
     st.session_state.drawdown_pct = st.number_input(
@@ -263,8 +274,6 @@ with st.sidebar.expander("🧮 Phương pháp map VS → Tỷ trọng", expanded
 st.sidebar.markdown("---")
 uploaded_csv = st.sidebar.file_uploader("📂 Import thông số từ CSV", type=["csv"])
 if uploaded_csv is not None:
-    # Dùng file_id để chỉ xử lý MỖI file một lần — tránh lặp rerun vô hạn
-    # (vì file_uploader vẫn giữ file đã chọn qua các lần rerun sau đó)
     csv_signature = f"{uploaded_csv.name}-{uploaded_csv.size}"
     if st.session_state.get("_last_csv_signature") != csv_signature:
         row = pd.read_csv(uploaded_csv).iloc[0].to_dict()
@@ -350,7 +359,7 @@ with log_header_col1:
     st.subheader("🗒️ Nhật ký lịch sử tính toán")
 with log_header_col2:
     if SHEETS_ON:
-        st.button("🔄 Làm mới")  # chỉ để trigger rerun, đọc lại sheet bên dưới
+        st.button("🔄 Làm mới")
 
 if SHEETS_ON:
     try:
