@@ -52,8 +52,42 @@ if "log" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp API Lấy dữ liệu VN-Index (DNSE & Gemini AI)
+# Tích hợp API Lấy dữ liệu VN-Index (VNDirect, DNSE & Gemini AI)
 # ---------------------------------------------------------------------------
+def fetch_vndirect_market_data() -> dict:
+    """Lấy trực tiếp P/E, P/B và Dividend Yield (DY) của VN-Index từ API VNDirect Finfo."""
+    url = "https://finfo-api.vndirect.com.vn/v2/disclosures?q=code:VNINDEX~type:RATIO&sort=reportDate:desc&size=1"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+    
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            data_list = res.get("data", [])
+            if data_list:
+                item = data_list[0]
+                pe_val = item.get("pe")
+                pb_val = item.get("pb")
+                dy_val = item.get("dividendYield")
+                
+                result = {}
+                if pe_val is not None:
+                    result["pe_current"] = float(pe_val)
+                if pb_val is not None:
+                    result["pb_current"] = float(pb_val)
+                if dy_val is not None:
+                    # Chuyển dạng tỉ lệ thập phân sang %
+                    result["dy_current"] = float(dy_val) * 100.0 if float(dy_val) <= 1.0 else float(dy_val)
+                return result
+    except Exception as e:
+        st.error(f"Lỗi truy xuất dữ liệu VNDirect: {e}")
+    
+    return {}
+
+
 def fetch_vnindex_yfinance() -> tuple[float, float]:
     """Tải lịch sử VN-Index từ DNSE Chart API v2."""
     now_ms = int(time.time() * 1000)
@@ -193,6 +227,20 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
 # Thanh bên trái (Sidebar) - Nhập liệu thông số
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Thông số đầu vào")
+
+with st.sidebar.expander("📊 VNDirect Dstock Auto-Fill", expanded=True):
+    if st.button("🔄 Lấy P/E, P/B, DY từ VNDirect", use_container_width=True):
+        with st.spinner("Đang kết nối VNDirect API..."):
+            vnd_data = fetch_vndirect_market_data()
+            if vnd_data:
+                if "pe_current" in vnd_data:
+                    st.session_state.pe_current = vnd_data["pe_current"]
+                if "pb_current" in vnd_data:
+                    st.session_state.pb_current = vnd_data["pb_current"]
+                if "dy_current" in vnd_data:
+                    st.session_state.dy_current = vnd_data["dy_current"]
+                st.success("Đã cập nhật dữ liệu P/E, P/B, DY từ VNDirect!")
+                st.rerun()
 
 with st.sidebar.expander("🤖 Google Gemini AI Auto-Fill", expanded=False):
     st.session_state.gemini_api_key = st.text_input(
