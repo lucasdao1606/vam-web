@@ -58,13 +58,16 @@ def fetch_vndirect_market_data() -> dict:
     """Lấy trực tiếp P/E, P/B và Dividend Yield (DY) của VN-Index từ API VNDirect Finfo."""
     url = "https://finfo-api.vndirect.com.vn/v2/disclosures?q=code:VNINDEX~type:RATIO&sort=reportDate:desc&size=1"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": "https://dstock.vndirect.com.vn",
+        "Referer": "https://dstock.vndirect.com.vn/",
     }
     
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=15) as response:
             res = json.loads(response.read().decode("utf-8"))
             data_list = res.get("data", [])
             if data_list:
@@ -79,9 +82,13 @@ def fetch_vndirect_market_data() -> dict:
                 if pb_val is not None:
                     result["pb_current"] = float(pb_val)
                 if dy_val is not None:
-                    # Chuyển dạng tỉ lệ thập phân sang %
                     result["dy_current"] = float(dy_val) * 100.0 if float(dy_val) <= 1.0 else float(dy_val)
                 return result
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError) or "timed out" in str(e.reason):
+            st.warning("⚠️ Kết nối tới VNDirect bị quá thời gian (Timeout). Vui lòng thử lại sau vài giây!")
+        else:
+            st.error(f"Lỗi truy xuất dữ liệu VNDirect: {e}")
     except Exception as e:
         st.error(f"Lỗi truy xuất dữ liệu VNDirect: {e}")
     
