@@ -1,3 +1,4 @@
+"""
 streamlit_app.py - VAM Portfolio Allocator (Web Edition)
 Phiên bản web của công cụ phân bổ danh mục đầu tư VAM (Valuation-based Asset Allocation).
 Tái sử dụng nguyên vẹn logic tính toán từ vam_core.py (không thay đổi công thức).
