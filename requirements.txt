@@ -3,3 +3,4 @@ pandas>=2.0
 matplotlib>=3.8
 gspread>=6.0
 google-auth>=2.30
+yfinance>=0.2.40
