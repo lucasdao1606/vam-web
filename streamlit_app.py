@@ -84,12 +84,13 @@ def fetch_vnindex_yfinance() -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp Google Gemini AI (Xử lý Quota 429 & Retry)
+# Tích hợp Google Gemini AI
 # ---------------------------------------------------------------------------
 GEMINI_FIELDS = [
     "pe_current", "pb_current", "rf", "dy_current",
     "price_current", "ma200", "volatility_current", "drawdown_pct",
 ]
+
 
 def get_available_gemini_model(encoded_key: str) -> str:
     """Tự động kiểm tra danh sách Model Gemini khả dụng."""
@@ -100,10 +101,11 @@ def get_available_gemini_model(encoded_key: str) -> str:
             res = json.loads(response.read().decode("utf-8"))
             models = res.get("models", [])
             priority_targets = [
-                "gemini-2.5-flash",
+                "gemini-3.6-flash",
+                "gemini-3.5-flash",
+                "gemini-3.0-flash",
                 "gemini-2.0-flash",
-                "gemini-1.5-flash",
-                "gemini-2.5-pro"
+                "gemini-1.5-flash"
             ]
             for target in priority_targets:
                 for m in models:
@@ -116,7 +118,7 @@ def get_available_gemini_model(encoded_key: str) -> str:
                     return m.get("name", "").replace("models/", "")
     except Exception:
         pass
-    return "gemini-2.5-flash"
+    return "gemini-3.6-flash"
 
 
 def fetch_market_data_via_gemini(api_key: str) -> dict:
@@ -146,15 +148,13 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
     Chỉ trả về JSON thuần túy.
     """
 
-    # Payload tiêu chuẩn không gắn Google Search Tool nặng nề để tiết kiệm Quota
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1}
     }
 
     data_bytes = json.dumps(payload).encode("utf-8")
-    
-    # Cơ chế Retry khi gặp lỗi 429
+
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -163,11 +163,11 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
             )
             with urllib.request.urlopen(req, timeout=25) as response:
                 res_data = json.loads(response.read().decode("utf-8"))
-                
+
             candidates = res_data.get("candidates", [])
             if not candidates:
                 raise Exception("Gemini AI không phản hồi dữ liệu.")
-                
+
             parts = candidates[0].get("content", {}).get("parts", [])
             text_response = "".join([p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]).strip()
 
@@ -179,12 +179,12 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
         except urllib.error.HTTPError as err:
             if err.code == 429:
                 if attempt < max_retries - 1:
-                    time.sleep(3 * (attempt + 1))  # Chờ 3s, 6s trước khi thử lại
+                    time.sleep(3 * (attempt + 1))
                     continue
-                raise Exception("Hạn mức Gemini API Free hiện đã đầy (Rate Limit 429). Vui lòng đợi 1 phút rồi bấm thử lại!")
+                raise Exception("Hạn mức Gemini API tạm thời vượt quá giới hạn. Vui lòng đợi 1 phút rồi thử lại!")
             err_body = err.read().decode("utf-8", errors="ignore")
             raise Exception(f"Lỗi gọi Gemini API ({err.code}): {err.reason}\n{err_body}")
-            
+
     raise Exception("Không thể kết nối Gemini API.")
 
 
@@ -268,7 +268,7 @@ with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
     st.session_state.volatility_avg = st.number_input(
         "Volatility TB lịch sử (%)", 0.0, 200.0, st.session_state.volatility_avg, 0.5
     )
-    
+
     current_drawdown = float(st.session_state.get("drawdown_pct", 0.0))
     current_drawdown = max(0.0, min(100.0, abs(current_drawdown)))
     st.session_state.drawdown_pct = st.number_input(
