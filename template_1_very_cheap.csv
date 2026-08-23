@@ -1,0 +1,2 @@
+age,pe_current,pe_min,pe_max,pb_current,pb_min,pb_max,rf,erp_min,erp_max,dy_current,dy_min,dy_max,w_pe,w_pb,w_erp,w_dy,price_current,ma200,volatility_current,volatility_avg,drawdown_pct,method
+30,10.5,10.0,20.0,1.4,1.35,2.6,2.5,1.5,7.0,3.1,1.2,3.2,30.0,20.0,35.0,15.0,1100.0,1250.0,14.0,17.5,18.5,step

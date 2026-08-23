@@ -51,7 +51,7 @@ class VAMOutputs:
 
 
 def _assess_score(score: float, metric_name: str) -> tuple[str, str]:
-    """Phân loại trạng thái dựa trên Z-Score chuẩn hóa."""
+    """Phân loại trạng thái định giá dựa trên Z-Score chuẩn hóa."""
     if score >= 0.5:
         if metric_name in ["P/E", "P/B"]:
             return "🟢 Rẻ (Tích cực)", "Định giá nằm ở vùng thấp so với lịch sử, mức giá hấp dẫn để tích lũy."
@@ -61,7 +61,7 @@ def _assess_score(score: float, metric_name: str) -> tuple[str, str]:
             return "🟢 Cao (Tích cực)", "Tỷ suất cổ tức vượt mức trung bình, dòng tiền cổ tức tốt."
     elif score <= -0.5:
         if metric_name in ["P/E", "P/B"]:
-            return "🔴 Đắt (Tiêu cực)", "Định giá nằm ở vùng cao so me lịch sử, tiềm ẩn rủi ro điều chỉnh."
+            return "🔴 Đắt (Tiêu cực)", "Định giá nằm ở vùng cao so với lịch sử, tiềm ẩn rủi ro điều chỉnh."
         elif metric_name == "ERP":
             return "🔴 Kém (Tiêu cực)", "Phần bù rủi ro mỏng so với TPCP, rủi ro/lợi nhuận không hấp dẫn."
         else:  # DY
@@ -73,7 +73,7 @@ def _assess_score(score: float, metric_name: str) -> tuple[str, str]:
 def compute(inputs: VAMInputs) -> VAMOutputs:
     """Hàm tính toán chính của mô hình VAM."""
 
-    # 1. P/E Score
+    # 1. P/E Score (Z-score đảo ngược: PE càng thấp score càng cao)
     pe_score = 0.0
     if inputs.pe_max > inputs.pe_min:
         mid_pe = (inputs.pe_max + inputs.pe_min) / 2.0
@@ -81,7 +81,7 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
         if sigma_pe > 0:
             pe_score = -((inputs.pe_current - mid_pe) / sigma_pe)
 
-    # 2. P/B Score
+    # 2. P/B Score (Z-score đảo ngược: PB càng thấp score càng cao)
     pb_score = 0.0
     if inputs.pb_max > inputs.pb_min:
         mid_pb = (inputs.pb_max + inputs.pb_min) / 2.0
@@ -89,7 +89,7 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
         if sigma_pb > 0:
             pb_score = -((inputs.pb_current - mid_pb) / sigma_pb)
 
-    # 3. ERP Score
+    # 3. ERP Score (Earning Yield - Rf)
     ep = (1.0 / inputs.pe_current * 100.0) if inputs.pe_current > 0 else 0.0
     erp = ep - inputs.rf
     erp_score = 0.0
@@ -121,36 +121,45 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
 
     vs = max(-2.0, min(2.0, vs))
 
-    # TAA Delta
+    # TAA Delta và Tỷ trọng tài sản
     taa_delta = vs * 10.0
     eq_weight = max(10.0, min(90.0, inputs.saa_equity + taa_delta))
     gold_weight = inputs.saa_gold
     bond_weight = max(0.0, 100.0 - eq_weight - gold_weight)
 
-    # Tổng hợp phân tích chi tiết từng tham số
+    # Đánh giá 4 chỉ số định giá
     pe_status, pe_comm = _assess_score(pe_score, "P/E")
     pb_status, pb_comm = _assess_score(pb_score, "P/B")
     erp_status, erp_comm = _assess_score(erp_score, "ERP")
     dy_status, dy_comm = _assess_score(dy_score, "DY")
 
+    # Tính độ lệch định lượng cho MA200 và Volatility
+    ma_diff_pct = ((inputs.price_current - inputs.ma200) / inputs.ma200) * 100.0 if inputs.ma200 > 0 else 0.0
+    vol_diff_pct = inputs.volatility_current - inputs.volatility_avg
+
     # Đánh giá Xu hướng MA200
     if inputs.price_current >= inputs.ma200:
-        ma_status, ma_comm = "🟢 Uptrend (Tích cực)", f"Giá ({inputs.price_current}) nằm trên đường MA200 ({inputs.ma200}), xu hướng dài hạn tăng."
+        ma_status = "🟢 Uptrend (Tích cực)"
+        ma_comm = f"Giá cao hơn MA200 {ma_diff_pct:+.1f}%, duy trì xu hướng tăng dài hạn."
     else:
-        ma_status, ma_comm = "🔴 Downtrend (Tiêu cực)", f"Giá ({inputs.price_current}) nằm dưới đường MA200 ({inputs.ma200}), xu hướng dài hạn suy yếu."
+        ma_status = "🔴 Downtrend (Tiêu cực)"
+        ma_comm = f"Giá thấp hơn MA200 {ma_diff_pct:+.1f}%, xu hướng dài hạn suy yếu."
 
-    # Đánh giá Biến động (Volatility)
+    # Đánh giá Mức biến động (Volatility)
     if inputs.volatility_current <= inputs.volatility_avg:
-        vol_status, vol_comm = "🟢 Ôn hòa (Tích cực)", f"Biến động ({inputs.volatility_current}%) thấp hơn hoặc bằng trung bình ({inputs.volatility_avg}%)."
+        vol_status = "🟢 Ôn hòa (Tích cực)"
+        vol_comm = f"Biến động thấp hơn TB {vol_diff_pct:+.1f}%, tâm lý thị trường ổn định."
     else:
-        vol_status, vol_comm = "🟡 Cao (Cảnh báo)", f"Biến động ({inputs.volatility_current}%) cao hơn trung bình ({inputs.volatility_avg}%), thị trường rủi ro hơn."
+        vol_status = "🟡 Cao (Cảnh báo)"
+        vol_comm = f"Biến động cao hơn TB {vol_diff_pct:+.1f}%, rủi ro biến động giá tăng."
 
+    # Bảng chi tiết trạng thái các tham số
     details = [
         {
             "parameter": "Định giá P/E",
             "current_value": f"{inputs.pe_current:.2f}",
             "benchmark_range": f"Min: {inputs.pe_min} - Max: {inputs.pe_max}",
-            "z_score": round(pe_score, 2),
+            "z_score": f"{pe_score:+.2f}",
             "status": pe_status,
             "comment": pe_comm,
         },
@@ -158,7 +167,7 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
             "parameter": "Định giá P/B",
             "current_value": f"{inputs.pb_current:.2f}",
             "benchmark_range": f"Min: {inputs.pb_min} - Max: {inputs.pb_max}",
-            "z_score": round(pb_score, 2),
+            "z_score": f"{pb_score:+.2f}",
             "status": pb_status,
             "comment": pb_comm,
         },
@@ -166,7 +175,7 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
             "parameter": "Phần bù rủi ro (ERP)",
             "current_value": f"{erp:.2f}%",
             "benchmark_range": f"Min: {inputs.erp_min}% - Max: {inputs.erp_max}%",
-            "z_score": round(erp_score, 2),
+            "z_score": f"{erp_score:+.2f}",
             "status": erp_status,
             "comment": erp_comm,
         },
@@ -174,7 +183,7 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
             "parameter": "Tỷ suất cổ tức (DY)",
             "current_value": f"{inputs.dy_current:.2f}%",
             "benchmark_range": f"Min: {inputs.dy_min}% - Max: {inputs.dy_max}%",
-            "z_score": round(dy_score, 2),
+            "z_score": f"{dy_score:+.2f}",
             "status": dy_status,
             "comment": dy_comm,
         },
@@ -182,7 +191,7 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
             "parameter": "Xu hướng (MA200)",
             "current_value": f"{inputs.price_current:.1f}",
             "benchmark_range": f"MA200: {inputs.ma200:.1f}",
-            "z_score": "-",
+            "z_score": f"{ma_diff_pct:+.1f}%",
             "status": ma_status,
             "comment": ma_comm,
         },
@@ -190,7 +199,7 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
             "parameter": "Mức biến động (Vol)",
             "current_value": f"{inputs.volatility_current:.1f}%",
             "benchmark_range": f"TB Lịch sử: {inputs.volatility_avg:.1f}%",
-            "z_score": "-",
+            "z_score": f"{vol_diff_pct:+.1f}%",
             "status": vol_status,
             "comment": vol_comm,
         },
