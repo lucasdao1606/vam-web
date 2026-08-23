@@ -49,40 +49,70 @@ if "log" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp DNSE API - Lấy giá hiện tại & MA200 cho VN-Index (Hoạt động tốt trên Cloud)
+# Tích hợp Dữ liệu VN-Index Multi-Source (Cơ chế Dự phòng 3 lớp)
 # ---------------------------------------------------------------------------
 def fetch_vnindex_yfinance() -> tuple[float, float]:
-    """Tải dữ liệu VN-Index từ DNSE API (Khắc phục triệt để lỗi bị chặn IP trên Cloud)"""
-    end_time = int(time.time())
-    start_time = end_time - (365 * 86400)  # Lấy dữ liệu 1 năm gần nhất
-
-    url = f"https://services.entrade.com.vn/chart-api/v2/ohlc/stock?from={start_time}&to={end_time}&symbol=VNINDEX&resolution=1D"
+    """
+    Tải dữ liệu VN-Index với cơ chế dự phòng tự động:
+    1. DNSE Chart API (Fix Timestamp Milliseconds)
+    2. SSI Public Chart API
+    3. Yahoo Finance (^VNI)
+    """
+    now_ts = int(time.time())
+    start_ts = now_ts - (365 * 86400)
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
 
+    # --- NGUỒN 1: DNSE API (Khắc phục timestamp milliseconds) ---
     try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as response:
+        dnse_url = f"https://services.entrade.com.vn/chart-api/v2/ohlc/stock?from={start_ts}&to={now_ts}&symbol=VNINDEX&resolution=1D"
+        req = urllib.request.Request(dnse_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as response:
             res = json.loads(response.read().decode("utf-8"))
+            if "c" in res and res["c"] and len(res["c"]) >= 200:
+                close_series = pd.Series(res["c"]).dropna().astype(float)
+                price_current = float(close_series.iloc[-1])
+                ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
+                return round(price_current, 2), round(ma200, 2)
+    except Exception:
+        pass
 
-        close_list = res.get("c", [])  # 'c' chứa danh sách giá đóng cửa trong JSON của DNSE
-        if not close_list:
-            raise Exception("Không nhận được dữ liệu chuỗi giá từ DNSE API.")
+    # --- NGUỒN 2: SSI API ---
+    try:
+        ssi_url = f"https://iband.ssi.com.vn/api/v1/chart/history?resolution=D&symbol=VNINDEX&from={start_ts}&to={now_ts}"
+        req = urllib.request.Request(ssi_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            data = res.get("data", {}) if isinstance(res, dict) else {}
+            close_list = data.get("c", [])
+            if close_list and len(close_list) >= 200:
+                close_series = pd.Series(close_list).dropna().astype(float)
+                price_current = float(close_series.iloc[-1])
+                ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
+                return round(price_current, 2), round(ma200, 2)
+    except Exception:
+        pass
 
-        close_series = pd.Series(close_list).dropna().astype(float)
-
-        if len(close_series) < 200:
-            raise Exception(f"Dữ liệu chỉ có {len(close_series)} phiên, không đủ 200 phiên để tính MA200.")
-
-        price_current = float(close_series.iloc[-1])
-        ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
-
-        return round(price_current, 2), round(ma200, 2)
-
+    # --- NGUỒN 3: Yahoo Finance API (^VNI) ---
+    try:
+        yf_url = f"https://query1.finance.yahoo.com/v8/finance/chart/^VNI?period1={start_ts}&period2={now_ts}&interval=1d"
+        req = urllib.request.Request(yf_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            chart = res.get("chart", {}).get("result", [])[0]
+            close_list = chart.get("indicators", {}).get("quote", [])[0].get("close", [])
+            close_series = pd.Series(close_list).dropna().astype(float)
+            if len(close_series) >= 200:
+                price_current = float(close_series.iloc[-1])
+                ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
+                return round(price_current, 2), round(ma200, 2)
     except Exception as e:
-        raise Exception(f"Lỗi lấy dữ liệu từ DNSE API: {str(e)}")
+        raise Exception(f"Không thể tải dữ liệu VN-Index từ cả 3 nguồn API (DNSE, SSI, Yahoo Finance). Chi tiết: {str(e)}")
+
+    raise Exception("Dữ liệu VN-Index tải về không đủ 200 phiên để tính toán MA200.")
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +267,7 @@ with st.sidebar.expander("⚖️ Trọng số 4 thành phần (%)", expanded=Tru
 
 with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
     if st.button("📈 Lấy giá & MA200 tự động", use_container_width=True):
-        with st.spinner("Đang tải dữ liệu VN-Index từ DNSE API..."):
+        with st.spinner("Đang tải dữ liệu VN-Index..."):
             try:
                 p_curr, ma_val = fetch_vnindex_yfinance()
                 st.session_state.price_current = p_curr
