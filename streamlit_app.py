@@ -206,13 +206,11 @@ with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
     st.session_state.volatility_avg = st.number_input(
         "Volatility TB lịch sử (%)", 0.0, 200.0, st.session_state.volatility_avg, 0.5
     )
+    # Đảm bảo giá trị luôn nằm trong khoảng 0.0 - 100.0 (lấy giá trị tuyệt đối nếu âm)
+    current_drawdown = float(st.session_state.get("drawdown_pct", 0.0))
+    current_drawdown = max(0.0, min(100.0, abs(current_drawdown)))
     st.session_state.drawdown_pct = st.number_input(
-        # Đảm bảo giá trị luôn nằm trong khoảng 0.0 - 100.0 (lấy giá trị tuyệt đối nếu âm)
-        current_drawdown = float(st.session_state.get("drawdown_pct", 0.0))
-        current_drawdown = max(0.0, min(100.0, abs(current_drawdown)))
-)
-st.session_state.drawdown_pct = st.number_input(
-    "Drawdown hiện tại (%)", 0.0, 100.0, current_drawdown, 0.5
+        "Drawdown hiện tại (%)", 0.0, 100.0, current_drawdown, 0.5
     )
 
 with st.sidebar.expander("🧮 Phương pháp map VS → Tỷ trọng", expanded=False):
