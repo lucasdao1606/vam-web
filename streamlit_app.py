@@ -14,7 +14,6 @@ from datetime import datetime
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-import yfinance as yf
 
 from vam_core import VAMInputs, compute
 from sheets_log import sheets_configured, append_log_row, load_log_df, make_log_row
@@ -49,42 +48,45 @@ if "log" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp yfinance - Lấy giá hiện tại & MA200 cho VN-Index (Tối ưu Cloud)
+# Tích hợp VNDirect API - Lấy giá hiện tại & MA200 cho VN-Index
 # ---------------------------------------------------------------------------
 def fetch_vnindex_yfinance() -> tuple[float, float]:
-    """Tải dữ liệu VN-Index từ Yahoo Finance và tính toán MA200"""
-    ticker_symbol = "^VNINDEX"
+    """Tải dữ liệu VN-Index từ VNDirect API (thay thế yfinance để tránh bị Cloud IP chặn)"""
+    url = "https://finfo-api.vndirect.com.vn/v4/stock_prices?sort=date&q=code:VNINDEX&size=300"
+    req = urllib.request.Request(
+        url, 
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    )
     
     try:
-        # Cách 1: Tải thông qua đối tượng Ticker
-        ticker = yf.Ticker(ticker_symbol)
-        df = ticker.history(period="1y", interval="1d")
-        
-        # Cách 2: Trường hợp Ticker trả về rỗng, thử dùng download
-        if df.empty:
-            df = yf.download(ticker_symbol, period="1y", interval="1d", progress=False, ignore_tz=True)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            data = res.get("data", [])
             
-        if df.empty:
-            raise Exception("Yahoo Finance không phản hồi dữ liệu hoặc IP máy chủ bị giới hạn tạm thời.")
-
-        # Trích xuất cột Close (xử lý cả cấu trúc MultiIndex)
-        if isinstance(df.columns, pd.MultiIndex):
-            close_series = df['Close'][ticker_symbol]
-        else:
-            close_series = df['Close']
-
-        close_series = close_series.dropna()
-
+        if not data:
+            raise Exception("Không nhận được dữ liệu từ API VNDirect.")
+            
+        df = pd.DataFrame(data)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            
+        close_col = "close" if "close" in df.columns else ("adClose" if "adClose" in df.columns else None)
+        if not close_col:
+            raise Exception("Không tìm thấy cột giá đóng cửa trong dữ liệu.")
+            
+        close_series = df[close_col].dropna().astype(float)
+        
         if len(close_series) < 200:
-            raise Exception(f"Dữ liệu lịch sử chỉ có {len(close_series)} phiên, không đủ 200 phiên để tính MA200.")
-
+            raise Exception(f"Dữ liệu chỉ có {len(close_series)} phiên, không đủ 200 phiên để tính MA200.")
+            
         price_current = float(close_series.iloc[-1])
         ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
-
+        
         return round(price_current, 2), round(ma200, 2)
-
+        
     except Exception as e:
-        raise Exception(f"Lỗi kết nối yfinance: {str(e)}")
+        raise Exception(f"Lỗi kết nối API VNDirect: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +240,8 @@ with st.sidebar.expander("⚖️ Trọng số 4 thành phần (%)", expanded=Tru
     st.session_state.w_dy = st.number_input("Trọng số DY (w4)", 0.0, 100.0, st.session_state.w_dy, 1.0)
 
 with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
-    if st.button("📈 Lấy giá & MA200 từ yfinance", use_container_width=True):
-        with st.spinner("Đang tải dữ liệu VN-Index từ Yahoo Finance..."):
+    if st.button("📈 Lấy giá & MA200 tự động", use_container_width=True):
+        with st.spinner("Đang tải dữ liệu VN-Index từ API..."):
             try:
                 p_curr, ma_val = fetch_vnindex_yfinance()
                 st.session_state.price_current = p_curr
@@ -247,7 +249,7 @@ with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
                 st.success(f"Cập nhật thành công! Giá: {p_curr} | MA200: {ma_val}")
                 st.rerun()
             except Exception as exc:
-                st.error(f"Lỗi tải yfinance: {exc}")
+                st.error(f"Lỗi tải dữ liệu: {exc}")
 
     st.session_state.price_current = st.number_input("Giá hiện tại", 0.0, 1e7, st.session_state.price_current, 1.0)
     st.session_state.ma200 = st.number_input("MA200", 0.0, 1e7, st.session_state.ma200, 1.0)
