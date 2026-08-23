@@ -110,12 +110,13 @@ def get_available_gemini_model(encoded_key: str) -> str:
             res = json.loads(response.read().decode("utf-8"))
             models = res.get("models", [])
             
+            # Ưu tiên mô hình gemini-3.6-flash mới nhất
             priority_targets = [
-                "gemini-2.5-flash", 
-                "gemini-2.0-flash", 
-                "gemini-1.5-flash",
-                "gemini-2.5-pro",
-                "gemini-1.5-pro"
+                "gemini-3.6-flash",
+                "gemini-3.5-flash",
+                "gemini-3.0-flash",
+                "gemini-2.0-flash",
+                "gemini-1.5-flash"
             ]
             for target in priority_targets:
                 for m in models:
@@ -133,11 +134,10 @@ def get_available_gemini_model(encoded_key: str) -> str:
     except Exception as exc:
         raise Exception(f"Không thể lấy danh sách Model Gemini: {exc}")
         
-    return "gemini-2.0-flash"
+    return "gemini-3.6-flash"
 
 
 def fetch_market_data_via_gemini(api_key: str) -> dict:
-    # 1. Lấy điểm chỉ số kỹ thuật từ DNSE
     dnse_price, dnse_ma200 = fetch_vnindex_yfinance()
 
     clean_key = api_key.strip()
@@ -191,7 +191,6 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
         
     parts = candidates[0].get("content", {}).get("parts", [])
     
-    # Sửa lỗi bóc tách text: Lọc an toàn chỉ lấy các phần có thuộc tính "text"
     text_response = ""
     for part in parts:
         if isinstance(part, dict) and "text" in part:
@@ -199,7 +198,6 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
             
     text_response = text_response.strip()
 
-    # Xử lý cắt chuỗi JSON an toàn
     if "{" in text_response and "}" in text_response:
         start_idx = text_response.find("{")
         end_idx = text_response.rfind("}") + 1
