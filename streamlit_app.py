@@ -1,7 +1,7 @@
 """
 streamlit_app.py - VAM Portfolio Allocator (Web Edition)
 Phiên bản web của công cụ phân bổ danh mục đầu tư VAM (Valuation-based Asset Allocation).
-Tái sử dụng nguyên vẹn logic tính toán từ vam_core.py (không thay đổi công thức).
+Tái sử dụng nguyên vẹn logic tính toán từ vam_core.py.
 Chạy: streamlit run streamlit_app.py
 """
 
@@ -10,7 +10,6 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
-from datetime import datetime
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -49,46 +48,65 @@ if "log" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp Dữ liệu VN-Index - Lấy từ DNSE (Tự động tính trung bình, không báo lỗi)
+# Tích hợp Dữ liệu VN-Index - Lấy dữ liệu thực tế từ DNSE API
 # ---------------------------------------------------------------------------
 def fetch_vnindex_yfinance() -> tuple[float, float]:
-    """Tải lịch sử VN-Index từ DNSE API. Tính MA200 nếu >=200 phiên, ngược lại tính trung bình số mẫu lấy được."""
+    """Tải lịch sử VN-Index từ DNSE API. 
+    Tính MA200 nếu >=200 phiên, ngược lại tính trung bình toàn bộ số mẫu lấy được.
+    """
     now_ts = int(time.time())
-    start_ts = now_ts - (730 * 86400)  # Lấy dữ liệu 2 năm trước (~500 phiên)
+    start_ts = now_ts - (730 * 86400)  # Lấy 2 năm gần nhất (~500 phiên giao dịch)
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Referer": "https://mkt.dnse.com.vn/",
     }
 
+    close_prices = []
+
+    # --- 1. Gọi DNSE API ---
     try:
         dnse_url = f"https://services.entrade.com.vn/chart-api/v2/ohlc/stock?from={start_ts}&to={now_ts}&symbol=VNINDEX&resolution=1D"
         req = urllib.request.Request(dnse_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             res = json.loads(response.read().decode("utf-8"))
-            
-            if "c" in res and res["c"]:
-                close_series = pd.Series(res["c"]).dropna().astype(float).reset_index(drop=True)
-                
-                if len(close_series) > 0:
-                    price_current = float(close_series.iloc[-1])
-                    
-                    # Nếu đủ 200 phiên thì lấy MA200, ít hơn thì lấy trung bình toàn bộ mẫu thu được
-                    if len(close_series) >= 200:
-                        ma_val = float(close_series.rolling(window=200).mean().iloc[-1])
-                    else:
-                        ma_val = float(close_series.mean())
-                        
-                    return round(price_current, 2), round(ma_val, 2)
+            if "c" in res and isinstance(res["c"], list) and len(res["c"]) > 0:
+                close_prices = [float(x) for x in res["c"] if x is not None]
     except Exception:
         pass
 
-    # Fallback an toàn tuyệt đối: Trả về giá trị hiện tại trong session nếu API DNSE lỗi kết nối
-    return float(st.session_state.price_current), float(st.session_state.ma200)
+    # --- 2. Dự phòng: Gọi API phụ nếu DNSE bị chặn kết nối ---
+    if not close_prices:
+        try:
+            backup_url = f"https://f247.com/api/v1/chart/history?symbol=VNINDEX&resolution=D&from={start_ts}&to={now_ts}"
+            req = urllib.request.Request(backup_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                res = json.loads(response.read().decode("utf-8"))
+                if "c" in res and isinstance(res["c"], list) and len(res["c"]) > 0:
+                    close_prices = [float(x) for x in res["c"] if x is not None]
+        except Exception:
+            pass
+
+    # --- Tính toán giá và MA ---
+    if close_prices:
+        close_series = pd.Series(close_prices).dropna().reset_index(drop=True)
+        if len(close_series) > 0:
+            price_current = float(close_series.iloc[-1])
+            
+            # Nếu >= 200 phiên thì lấy MA200, ít hơn thì lấy trung bình mẫu thu được
+            if len(close_series) >= 200:
+                ma_val = float(close_series.rolling(window=200).mean().iloc[-1])
+            else:
+                ma_val = float(close_series.mean())
+                
+            return round(price_current, 2), round(ma_val, 2)
+
+    raise Exception("Không thể truy xuất dữ liệu từ DNSE. Vui lòng kiểm tra kết nối mạng hoặc thử lại sau.")
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp Google Gemini AI - tự động lấy dữ liệu thị trường VN-Index
+# Tích hợp Google Gemini AI - Tự động lấy dữ liệu thị trường VN-Index
 # ---------------------------------------------------------------------------
 GEMINI_FIELDS = [
     "pe_current", "pb_current", "rf", "dy_current",
@@ -182,7 +200,7 @@ st.sidebar.title("⚙️ Thông số đầu vào")
 with st.sidebar.expander("🤖 Google Gemini AI Auto-Fill", expanded=False):
     st.session_state.gemini_api_key = st.text_input(
         "Gemini API Key", value=st.session_state.gemini_api_key, type="password",
-        help="Key chỉ lưu trong phiên làm việc hiện tại, không được ghi ra máy chủ.",
+        help="Key chỉ lưu trong phiên làm việc hiện tại, không ghi ra máy chủ.",
     )
     if st.button("Tự động lấy dữ liệu AI"):
         if not st.session_state.gemini_api_key:
@@ -239,12 +257,15 @@ with st.sidebar.expander("⚖️ Trọng số 4 thành phần (%)", expanded=Tru
 
 with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
     if st.button("📈 Lấy giá & MA200 tự động", use_container_width=True):
-        with st.spinner("Đang tải dữ liệu DNSE..."):
-            p_curr, ma_val = fetch_vnindex_yfinance()
-            st.session_state.price_current = p_curr
-            st.session_state.ma200 = ma_val
-            st.success(f"Cập nhật thành công! Giá: {p_curr} | MA: {ma_val}")
-            st.rerun()
+        with st.spinner("Đang tải dữ liệu từ DNSE..."):
+            try:
+                p_curr, ma_val = fetch_vnindex_yfinance()
+                st.session_state.price_current = p_curr
+                st.session_state.ma200 = ma_val
+                st.success(f"Cập nhật thành công! Giá: {p_curr} | MA: {ma_val}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Thất bại: {exc}")
 
     st.session_state.price_current = st.number_input("Giá hiện tại", 0.0, 1e7, st.session_state.price_current, 1.0)
     st.session_state.ma200 = st.number_input("MA200", 0.0, 1e7, st.session_state.ma200, 1.0)
@@ -281,7 +302,7 @@ if uploaded_csv is not None:
         st.sidebar.success("Đã nạp thông số từ CSV.")
         st.rerun()
     else:
-        st.sidebar.caption("✅ Đã nạp file này rồi. Chọn file khác hoặc bấm Tính toán phân bổ bên dưới.")
+        st.sidebar.caption("✅ Đã nạp file này rồi. Bấm nút tính toán phân bổ bên dưới.")
 
 calc_clicked = st.sidebar.button("🚀 Tính toán phân bổ", use_container_width=True, type="primary")
 
@@ -368,8 +389,7 @@ if SHEETS_ON:
 else:
     log_df = pd.DataFrame(st.session_state.log)
     st.caption(
-        "⚠️ Chưa cấu hình Google Sheets — log chỉ tồn tại trong phiên hiện tại (mất khi tải lại trang). "
-        "Xem README.md phần \"Thiết lập Google Sheets\" để bật lưu vĩnh viễn."
+        "⚠️ Chưa cấu hình Google Sheets — log chỉ tồn tại trong phiên hiện tại (mất khi tải lại trang)."
     )
 
 if not log_df.empty:
