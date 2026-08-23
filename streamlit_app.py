@@ -196,9 +196,10 @@ def get_available_gemini_model(encoded_key: str) -> str:
             res = json.loads(response.read().decode("utf-8"))
             models = res.get("models", [])
             priority_targets = [
-                "gemini-2.5-flash",
+                "gemini-1.5-flash",
+                "gemini-1.5-pro",
                 "gemini-2.0-flash",
-                "gemini-1.5-flash"
+                "gemini-1.0-pro"
             ]
             for target in priority_targets:
                 for m in models:
@@ -211,7 +212,7 @@ def get_available_gemini_model(encoded_key: str) -> str:
                     return m.get("name", "").replace("models/", "")
     except Exception:
         pass
-    return "gemini-2.5-flash"
+    return "gemini-1.5-flash"
 
 
 def fetch_market_data_via_gemini(api_key: str) -> dict:
@@ -277,7 +278,8 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
                     continue
                 raise Exception("Hạn mức Gemini API tạm thời vượt quá giới hạn. Vui lòng đợi 1 phút!")
             err_body = err.read().decode("utf-8", errors="ignore")
-            raise Exception(f"Lỗi gọi Gemini API ({err.code}): {err.reason}\n{err_body}")
+            raise Exception(f"Lỗi gọi Gemini API ({err.code}): {err.reason}
+{err_body}")
 
     raise Exception("Không thể kết nối Gemini API.")
 
@@ -464,7 +466,9 @@ with col1:
 
         # Hiển thị nhận xét tổng quan VAM Score
         if hasattr(result, "overall_assessment") and result.overall_assessment:
-            st.info(f"**Đánh giá tổng thể:** {result.overall_assessment}\n\n💡 *{result.overall_comment}*")
+            st.info(f"**Đánh giá tổng thể:** {result.overall_assessment}
+
+💡 *{result.overall_comment}*")
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Cổ phiếu", f"{result.equity_weight:.1f}%")
