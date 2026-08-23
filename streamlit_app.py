@@ -278,8 +278,7 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
                     continue
                 raise Exception("Hạn mức Gemini API tạm thời vượt quá giới hạn. Vui lòng đợi 1 phút!")
             err_body = err.read().decode("utf-8", errors="ignore")
-            raise Exception(f"Lỗi gọi Gemini API ({err.code}): {err.reason}
-{err_body}")
+            raise Exception(f"Lỗi gọi Gemini API ({err.code}): {err.reason}\n{err_body}")
 
     raise Exception("Không thể kết nối Gemini API.")
 
@@ -466,9 +465,7 @@ with col1:
 
         # Hiển thị nhận xét tổng quan VAM Score
         if hasattr(result, "overall_assessment") and result.overall_assessment:
-            st.info(f"**Đánh giá tổng thể:** {result.overall_assessment}
-
-💡 *{result.overall_comment}*")
+            st.info(f"**Đánh giá tổng thể:** {result.overall_assessment}\n\n💡 *{result.overall_comment}*")
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Cổ phiếu", f"{result.equity_weight:.1f}%")
