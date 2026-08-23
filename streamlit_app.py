@@ -354,6 +354,11 @@ with col1:
         st.info('Nhập thông số ở thanh bên trái và bấm "🚀 Tính toán phân bổ".')
     else:
         st.metric("Điểm định giá (Valuation Score)", f"{result.valuation_score:.2f}")
+
+        # Hiển thị nhận xét tổng quan VAM Score
+        if hasattr(result, "overall_assessment") and result.overall_assessment:
+            st.info(f"**Đánh giá tổng thể:** {result.overall_assessment}\n\n💡 *{result.overall_comment}*")
+
         m1, m2, m3 = st.columns(3)
         m1.metric("Cổ phiếu", f"{result.equity_weight:.1f}%")
         m2.metric("Trái phiếu", f"{result.bond_weight:.1f}%")
@@ -387,12 +392,11 @@ if result is not None:
     if hasattr(result, "details") and result.details:
         details_data = result.details
     else:
-        # Fallback nếu dùng vam_core phiên bản cũ
         details_data = [
-            {"parameter": "P/E", "current_value": st.session_state.pe_current, "z_score": result.pe_score, "status": "🟢 Rẻ" if result.pe_score >= 0.5 else ("🔴 Đắt" if result.pe_score <= -0.5 else "🟡 Trung vị")},
-            {"parameter": "P/B", "current_value": st.session_state.pb_current, "z_score": result.pb_score, "status": "🟢 Rẻ" if result.pb_score >= 0.5 else ("🔴 Đắt" if result.pb_score <= -0.5 else "🟡 Trung vị")},
-            {"parameter": "ERP", "current_value": "-", "z_score": result.erp_score, "status": "🟢 Tích cực" if result.erp_score >= 0.5 else ("🔴 Tiêu cực" if result.erp_score <= -0.5 else "🟡 Cân bằng")},
-            {"parameter": "DY", "current_value": f"{st.session_state.dy_current}%", "z_score": result.dy_score, "status": "🟢 Tích cực" if result.dy_score >= 0.5 else ("🔴 Tiêu cực" if result.dy_score <= -0.5 else "🟡 Cân bằng")},
+            {"parameter": "P/E", "current_value": st.session_state.pe_current, "z_score": f"{result.pe_score:+.2f}", "status": "🟢 Rẻ" if result.pe_score >= 0.5 else ("🔴 Đắt" if result.pe_score <= -0.5 else "🟡 Trung vị")},
+            {"parameter": "P/B", "current_value": st.session_state.pb_current, "z_score": f"{result.pb_score:+.2f}", "status": "🟢 Rẻ" if result.pb_score >= 0.5 else ("🔴 Đắt" if result.pb_score <= -0.5 else "🟡 Trung vị")},
+            {"parameter": "ERP", "current_value": "-", "z_score": f"{result.erp_score:+.2f}", "status": "🟢 Tích cực" if result.erp_score >= 0.5 else ("🔴 Tiêu cực" if result.erp_score <= -0.5 else "🟡 Cân bằng")},
+            {"parameter": "DY", "current_value": f"{st.session_state.dy_current}%", "z_score": f"{result.dy_score:+.2f}", "status": "🟢 Tích cực" if result.dy_score >= 0.5 else ("🔴 Tiêu cực" if result.dy_score <= -0.5 else "🟡 Cân bằng")},
         ]
 
     details_df = pd.DataFrame(details_data)
@@ -402,8 +406,8 @@ if result is not None:
         column_config={
             "parameter": "Chỉ số / Tham số",
             "current_value": "Giá trị hiện tại",
-            "benchmark_range": "Dải tham chiếu (Min - Max)",
-            "z_score": "Điểm Z-Score",
+            "benchmark_range": "Dải tham chiếu (Min - Max / TB)",
+            "z_score": "Điểm Z-Score / % Lệch",
             "status": "Đánh giá trạng thái",
             "comment": "Nhận xét chi tiết",
         },

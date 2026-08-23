@@ -47,6 +47,8 @@ class VAMOutputs:
     pb_score: float
     erp_score: float
     dy_score: float
+    overall_assessment: str = ""
+    overall_comment: str = ""
     details: list[dict] = field(default_factory=list)
 
 
@@ -70,10 +72,24 @@ def _assess_score(score: float, metric_name: str) -> tuple[str, str]:
         return "🟡 Trung vị (Cân bằng)", "Định giá xoay quanh mức trung bình lịch sử, thị trường ở mức cân bằng."
 
 
+def _assess_overall_vs(vs: float) -> tuple[str, str]:
+    """Đánh giá nhận xét tổng quan dựa trên điểm Valuation Score (VS)."""
+    if vs >= 1.0:
+        return "🟢 Định giá Rất Rẻ (Tăng tỷ trọng mạnh)", "Thị trường đang ở vùng định giá rất hấp dẫn. Khuyến nghị gia tăng tối đa tỷ trọng Cổ phiếu so với SAA chuẩn."
+    elif vs >= 0.3:
+        return "🟢 Định giá Hấp Dẫn (Tăng tỷ trọng nhẹ)", "Thị trường đang rẻ hơn trung bình lịch sử. Khuyến nghị tăng nhẹ tỷ trọng Cổ phiếu."
+    elif vs <= -1.0:
+        return "🔴 Định giá Rất Đắt (Hạ tỷ trọng mạnh)", "Thị trường đang ở mức định giá rất cao/rủi ro. Khuyến nghị hạ mạnh tỷ trọng Cổ phiếu về mức an toàn và gia tăng Trái phiếu/Tiền mặt."
+    elif vs <= -0.3:
+        return "🔴 Định giá Cao (Hạ tỷ trọng nhẹ)", "Thị trường đang cao hơn mức cân bằng. Khuyến nghị giảm nhẹ tỷ trọng Cổ phiếu để quản trị rủi ro."
+    else:
+        return "🟡 Định giá Cân Bằng (Giữ SAA chuẩn)", "Thị trường đang phản ánh đúng giá trị trung bình lịch sử. Khuyến nghị duy trì tỷ trọng phân bổ Cổ phiếu theo SAA cơ sở."
+
+
 def compute(inputs: VAMInputs) -> VAMOutputs:
     """Hàm tính toán chính của mô hình VAM."""
 
-    # 1. P/E Score (Z-score đảo ngược: PE càng thấp score càng cao)
+    # 1. P/E Score
     pe_score = 0.0
     if inputs.pe_max > inputs.pe_min:
         mid_pe = (inputs.pe_max + inputs.pe_min) / 2.0
@@ -81,7 +97,7 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
         if sigma_pe > 0:
             pe_score = -((inputs.pe_current - mid_pe) / sigma_pe)
 
-    # 2. P/B Score (Z-score đảo ngược: PB càng thấp score càng cao)
+    # 2. P/B Score
     pb_score = 0.0
     if inputs.pb_max > inputs.pb_min:
         mid_pb = (inputs.pb_max + inputs.pb_min) / 2.0
@@ -89,7 +105,7 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
         if sigma_pb > 0:
             pb_score = -((inputs.pb_current - mid_pb) / sigma_pb)
 
-    # 3. ERP Score (Earning Yield - Rf)
+    # 3. ERP Score
     ep = (1.0 / inputs.pe_current * 100.0) if inputs.pe_current > 0 else 0.0
     erp = ep - inputs.rf
     erp_score = 0.0
@@ -127,6 +143,9 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
     gold_weight = inputs.saa_gold
     bond_weight = max(0.0, 100.0 - eq_weight - gold_weight)
 
+    # Nhận xét tổng quan VAM Score
+    overall_assessment, overall_comment = _assess_overall_vs(vs)
+
     # Đánh giá 4 chỉ số định giá
     pe_status, pe_comm = _assess_score(pe_score, "P/E")
     pb_status, pb_comm = _assess_score(pb_score, "P/B")
@@ -153,7 +172,6 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
         vol_status = "🟡 Cao (Cảnh báo)"
         vol_comm = f"Biến động cao hơn TB {vol_diff_pct:+.1f}%, rủi ro biến động giá tăng."
 
-    # Bảng chi tiết trạng thái các tham số
     details = [
         {
             "parameter": "Định giá P/E",
@@ -214,5 +232,7 @@ def compute(inputs: VAMInputs) -> VAMOutputs:
         pb_score=round(pb_score, 2),
         erp_score=round(erp_score, 2),
         dy_score=round(dy_score, 2),
+        overall_assessment=overall_assessment,
+        overall_comment=overall_comment,
         details=details,
     )
