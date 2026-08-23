@@ -283,17 +283,32 @@ with st.sidebar.expander("🧮 Phương pháp map VS → Tỷ trọng", expanded
     st.session_state.method = "step" if method_label.startswith("Bậc") else "linear"
 
 st.sidebar.markdown("---")
-uploaded_csv = st.sidebar.file_uploader("📂 Import thông số từ CSV", type=["csv"])
-if uploaded_csv is not None:
-    csv_signature = f"{uploaded_csv.name}-{uploaded_csv.size}"
-    if st.session_state.get("_last_csv_signature") != csv_signature:
-        row = pd.read_csv(uploaded_csv).iloc[0].to_dict()
-        for k in DEFAULTS:
-            if k in row and pd.notna(row[k]) and k != "gemini_api_key":
-                st.session_state[k] = row[k] if k in ("age", "method") else float(row[k])
-        st.session_state["_last_csv_signature"] = csv_signature
-        st.sidebar.success("Đã nạp thông số từ CSV.")
-        st.rerun()
+
+# Import / Export Cấu hình CSV
+with st.sidebar.expander("📂 Quản lý thông số CSV", expanded=True):
+    uploaded_csv = st.file_uploader("Import thông số từ CSV", type=["csv"])
+    if uploaded_csv is not None:
+        csv_signature = f"{uploaded_csv.name}-{uploaded_csv.size}"
+        if st.session_state.get("_last_csv_signature") != csv_signature:
+            row = pd.read_csv(uploaded_csv).iloc[0].to_dict()
+            for k in DEFAULTS:
+                if k in row and pd.notna(row[k]) and k != "gemini_api_key":
+                    st.session_state[k] = row[k] if k in ("age", "method") else float(row[k])
+            st.session_state["_last_csv_signature"] = csv_signature
+            st.success("Đã nạp thông số từ CSV!")
+            st.rerun()
+
+    # Tạo DataFrame chứa các tham số hiện tại để xuất file CSV
+    current_params = {k: [st.session_state[k]] for k in DEFAULTS if k != "gemini_api_key"}
+    export_df = pd.DataFrame(current_params)
+    
+    st.download_button(
+        label="💾 Xuất thông số hiện tại (CSV)",
+        data=export_df.to_csv(index=False).encode("utf-8"),
+        file_name="vam_inputs_config.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
 
 calc_clicked = st.sidebar.button("🚀 Tính toán phân bổ", use_container_width=True, type="primary")
 
