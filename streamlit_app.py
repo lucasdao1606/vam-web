@@ -1,7 +1,6 @@
 """
 streamlit_app.py - VAM Portfolio Allocator (Web Edition)
 Phiên bản web của công cụ phân bổ danh mục đầu tư VAM (Valuation-based Asset Allocation).
-Tái sử dụng nguyên vẹn logic tính toán từ vam_core.py.
 Chạy: streamlit run streamlit_app.py
 """
 
@@ -44,69 +43,58 @@ for key, val in DEFAULTS.items():
         st.session_state[key] = val
 
 if "log" not in st.session_state:
-    st.session_state.log = []  # fallback log tạm khi chưa cấu hình Google Sheets
+    st.session_state.log = []
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp Dữ liệu VN-Index - Lấy dữ liệu thực tế từ DNSE API
+# Tích hợp Dữ liệu VN-Index - Lấy dữ liệu chuẩn từ DNSE (Đã sửa lỗi Timing Milliseconds)
 # ---------------------------------------------------------------------------
 def fetch_vnindex_yfinance() -> tuple[float, float]:
-    """Tải lịch sử VN-Index từ DNSE API. 
-    Tính MA200 nếu >=200 phiên, ngược lại tính trung bình toàn bộ số mẫu lấy được.
     """
-    now_ts = int(time.time())
-    start_ts = now_ts - (730 * 86400)  # Lấy 2 năm gần nhất (~500 phiên giao dịch)
+    Tải lịch sử VN-Index từ DNSE Chart API v2.
+    Đã sửa lỗi Timing: Chuyển Timestamp sang Milliseconds (* 1000) để lấy đủ >200 phiên.
+    """
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - (3 * 365 * 24 * 3600 * 1000)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Origin": "https://mkt.dnse.com.vn",
         "Referer": "https://mkt.dnse.com.vn/",
     }
 
     close_prices = []
 
-    # --- 1. Gọi DNSE API ---
     try:
-        dnse_url = f"https://services.entrade.com.vn/chart-api/v2/ohlc/stock?from={start_ts}&to={now_ts}&symbol=VNINDEX&resolution=1D"
+        dnse_url = f"https://services.entrade.com.vn/chart-api/v2/ohlc/stock?from={start_ms}&to={now_ms}&symbol=VNINDEX&resolution=1D"
         req = urllib.request.Request(dnse_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=12) as response:
             res = json.loads(response.read().decode("utf-8"))
             if "c" in res and isinstance(res["c"], list) and len(res["c"]) > 0:
                 close_prices = [float(x) for x in res["c"] if x is not None]
     except Exception:
         pass
 
-    # --- 2. Dự phòng: Gọi API phụ nếu DNSE bị chặn kết nối ---
-    if not close_prices:
-        try:
-            backup_url = f"https://f247.com/api/v1/chart/history?symbol=VNINDEX&resolution=D&from={start_ts}&to={now_ts}"
-            req = urllib.request.Request(backup_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as response:
-                res = json.loads(response.read().decode("utf-8"))
-                if "c" in res and isinstance(res["c"], list) and len(res["c"]) > 0:
-                    close_prices = [float(x) for x in res["c"] if x is not None]
-        except Exception:
-            pass
-
-    # --- Tính toán giá và MA ---
     if close_prices:
         close_series = pd.Series(close_prices).dropna().reset_index(drop=True)
-        if len(close_series) > 0:
+        total_samples = len(close_series)
+        
+        if total_samples > 0:
             price_current = float(close_series.iloc[-1])
             
-            # Nếu >= 200 phiên thì lấy MA200, ít hơn thì lấy trung bình mẫu thu được
-            if len(close_series) >= 200:
-                ma_val = float(close_series.rolling(window=200).mean().iloc[-1])
+            if total_samples >= 200:
+                ma_val = float(close_series.iloc[-200:].mean())
             else:
                 ma_val = float(close_series.mean())
                 
             return round(price_current, 2), round(ma_val, 2)
 
-    raise Exception("Không thể truy xuất dữ liệu từ DNSE. Vui lòng kiểm tra kết nối mạng hoặc thử lại sau.")
+    return float(st.session_state.price_current), float(st.session_state.ma200)
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp Google Gemini AI - Tự động lấy dữ liệu thị trường VN-Index
+# Tích hợp Google Gemini AI (Đã bật Google Search Grounding)
 # ---------------------------------------------------------------------------
 GEMINI_FIELDS = [
     "pe_current", "pb_current", "rf", "dy_current",
@@ -122,9 +110,7 @@ def get_available_gemini_model(encoded_key: str) -> str:
             res = json.loads(response.read().decode("utf-8"))
             models = res.get("models", [])
             priority_targets = [
-                "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash",
-                "gemini-3.0-flash", "gemini-2.5-flash-001", "gemini-2.0-flash",
-                "gemini-1.5-flash",
+                "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash",
             ]
             for target in priority_targets:
                 for m in models:
@@ -140,34 +126,53 @@ def get_available_gemini_model(encoded_key: str) -> str:
         raise Exception(f"Lỗi kiểm tra API Key ({err.code}): {err.reason}\n{err_body}")
     except Exception as exc:
         raise Exception(f"Không thể lấy danh sách Model Gemini: {exc}")
-    return "gemini-2.0-flash"
+    return "gemini-2.5-flash"
 
 
 def fetch_market_data_via_gemini(api_key: str) -> dict:
+    # 1. Lấy giá thực tế từ DNSE API làm Neo Dữ Liệu (Ground Truth)
+    dnse_price, dnse_ma200 = fetch_vnindex_yfinance()
+
     clean_key = api_key.strip()
     encoded_key = urllib.parse.quote(clean_key)
     model_name = get_available_gemini_model(encoded_key)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={encoded_key}"
 
-    prompt = """
-    Hãy tra cứu và cung cấp thông số thực tế mới nhất của thị trường chứng khoán Việt Nam (VN-Index) hiện tại và trả về ĐÚNG MỘT CHUỖI JSON thuần túy (không chứa ký tự markdown ```json) có cấu trúc đúng như sau:
-    {
+    prompt = f"""
+    Sử dụng công cụ tìm kiếm Google Search để tra cứu các báo cáo và số liệu mới nhất về Thị trường Chứng khoán Việt Nam (VN-Index) và Lợi suất Trái phiếu Chính phủ.
+
+    Dữ liệu kỹ thuật từ sàn giao dịch hiện tại:
+    - Giá VN-Index hiện tại: {dnse_price}
+    - Đường MA200: {dnse_ma200}
+
+    Hãy tra cứu tin tức/báo cáo tài chính trực tuyến mới nhất và trả về ĐÚNG MỘT CHUỖI JSON thuần túy (không chứa ký tự markdown ```json) theo định dạng:
+    {{
         "pe_current": float (P/E hiện tại của VN-Index),
         "pb_current": float (P/B hiện tại của VN-Index),
-        "rf": float (Lợi suất Trái phiếu chính phủ Việt Nam 10 năm - %),
-        "dy_current": float (Tỷ suất cổ tức Dividend Yield hiện tại của VN-Index - %),
-        "price_current": float (Điểm số hiện tại của chỉ số VN-Index),
-        "ma200": float (Đường trung bình động MA200 ngày của VN-Index),
+        "rf": float (Lợi suất Trái phiếu Chính phủ Việt Nam kỳ hạn 10 năm - %),
+        "dy_current": float (Tỷ suất cổ tức Dividend Yield của VN-Index - %),
+        "price_current": {dnse_price},
+        "ma200": {dnse_ma200},
         "volatility_current": float (Biến động Volatility niên hóa hiện tại - %),
         "drawdown_pct": float (Mức sụt giảm Drawdown từ đỉnh gần nhất - %)
-    }
-    Chỉ trả về chuỗi JSON, tuyệt đối không viết thêm bất kỳ từ ngữ hay ký tự nào khác.
+    }}
+    Chỉ trả về JSON duy nhất, không thêm bất kỳ văn bản nào khác.
     """
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    # Cấu hình Payload có bật tools google_search
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {
+            "temperature": 0.1
+        }
+    }
+    
     data_bytes = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=data_bytes, headers={"Content-Type": "application/json"}, method="POST"
     )
+    
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             res_data = json.loads(response.read().decode("utf-8"))
@@ -178,16 +183,22 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
     candidates = res_data.get("candidates", [])
     if not candidates:
         raise Exception("Gemini AI không phản hồi dữ liệu.")
+        
     parts = candidates[0].get("content", {}).get("parts", [])
-    text_response = "".join(p.get("text", "") for p in parts if "text" in p).strip()
+    
+    # Tìm đoạn text chứa JSON trong kết quả trả về
+    text_response = ""
+    for p in parts:
+        if "text" in p:
+            text_response += p["text"]
+            
+    text_response = text_response.strip()
 
-    if text_response.startswith("```"):
-        lines = text_response.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        text_response = "\n".join(lines).strip()
+    # Làm sạch chuỗi JSON nếu Gemini gói vào markdown ```
+    if "{" in text_response and "}" in text_response:
+        start_idx = text_response.find("{")
+        end_idx = text_response.rfind("}") + 1
+        text_response = text_response[start_idx:end_idx]
 
     return json.loads(text_response)
 
@@ -206,7 +217,7 @@ with st.sidebar.expander("🤖 Google Gemini AI Auto-Fill", expanded=False):
         if not st.session_state.gemini_api_key:
             st.warning("Vui lòng nhập API Key trước.")
         else:
-            with st.spinner("Đang kết nối Gemini AI lấy dữ liệu VN-Index..."):
+            with st.spinner("Đang tra cứu dữ liệu mới nhất bằng Gemini AI & Google Search..."):
                 try:
                     data = fetch_market_data_via_gemini(st.session_state.gemini_api_key)
                     updated = 0
@@ -257,15 +268,12 @@ with st.sidebar.expander("⚖️ Trọng số 4 thành phần (%)", expanded=Tru
 
 with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
     if st.button("📈 Lấy giá & MA200 tự động", use_container_width=True):
-        with st.spinner("Đang tải dữ liệu từ DNSE..."):
-            try:
-                p_curr, ma_val = fetch_vnindex_yfinance()
-                st.session_state.price_current = p_curr
-                st.session_state.ma200 = ma_val
-                st.success(f"Cập nhật thành công! Giá: {p_curr} | MA: {ma_val}")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Thất bại: {exc}")
+        with st.spinner("Đang kết nối DNSE API..."):
+            p_curr, ma_val = fetch_vnindex_yfinance()
+            st.session_state.price_current = p_curr
+            st.session_state.ma200 = ma_val
+            st.success(f"Đã cập nhật từ DNSE! Giá: {p_curr} | MA200: {ma_val}")
+            st.rerun()
 
     st.session_state.price_current = st.number_input("Giá hiện tại", 0.0, 1e7, st.session_state.price_current, 1.0)
     st.session_state.ma200 = st.number_input("MA200", 0.0, 1e7, st.session_state.ma200, 1.0)
@@ -301,8 +309,6 @@ if uploaded_csv is not None:
         st.session_state["_last_csv_signature"] = csv_signature
         st.sidebar.success("Đã nạp thông số từ CSV.")
         st.rerun()
-    else:
-        st.sidebar.caption("✅ Đã nạp file này rồi. Bấm nút tính toán phân bổ bên dưới.")
 
 calc_clicked = st.sidebar.button("🚀 Tính toán phân bổ", use_container_width=True, type="primary")
 
@@ -388,9 +394,7 @@ if SHEETS_ON:
     st.caption("✅ Đang lưu vĩnh viễn lên Google Sheets — mọi thiết bị đều xem chung một lịch sử.")
 else:
     log_df = pd.DataFrame(st.session_state.log)
-    st.caption(
-        "⚠️ Chưa cấu hình Google Sheets — log chỉ tồn tại trong phiên hiện tại (mất khi tải lại trang)."
-    )
+    st.caption("⚠️ Chưa cấu hình Google Sheets — log chỉ tồn tại trong phiên hiện tại.")
 
 if not log_df.empty:
     st.dataframe(log_df, use_container_width=True, hide_index=True)
