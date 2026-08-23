@@ -210,7 +210,7 @@ with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
         # Đảm bảo giá trị luôn nằm trong khoảng 0.0 - 100.0 (lấy giá trị tuyệt đối nếu âm)
         current_drawdown = float(st.session_state.get("drawdown_pct", 0.0))
         current_drawdown = max(0.0, min(100.0, abs(current_drawdown)))
-
+)
 st.session_state.drawdown_pct = st.number_input(
     "Drawdown hiện tại (%)", 0.0, 100.0, current_drawdown, 0.5
     )
