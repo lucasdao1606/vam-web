@@ -298,10 +298,9 @@ with st.sidebar.expander("📂 Quản lý thông số CSV", expanded=True):
             st.success("Đã nạp thông số từ CSV!")
             st.rerun()
 
-    # Tạo DataFrame chứa các tham số hiện tại để xuất file CSV
     current_params = {k: [st.session_state[k]] for k in DEFAULTS if k != "gemini_api_key"}
     export_df = pd.DataFrame(current_params)
-    
+
     st.download_button(
         label="💾 Xuất thông số hiện tại (CSV)",
         data=export_df.to_csv(index=False).encode("utf-8"),
@@ -376,6 +375,28 @@ with col2:
         ax.pie(weights, labels=labels, autopct="%1.1f%%", startangle=140, colors=colors, explode=(0.05, 0, 0))
         ax.axis("equal")
     st.pyplot(fig)
+
+# ---------------------------------------------------------------------------
+# Bảng đánh giá chi tiết từng tham số
+# ---------------------------------------------------------------------------
+if result is not None and getattr(result, "details", None):
+    st.markdown("---")
+    st.subheader("🔍 Phân tích chi tiết vị thế tham số đầu vào")
+    
+    details_df = pd.DataFrame(result.details)
+    st.dataframe(
+        details_df,
+        column_config={
+            "parameter": "Chỉ số / Tham số",
+            "current_value": "Giá trị hiện tại",
+            "benchmark_range": "Dải tham chiếu (Min - Max / TB)",
+            "z_score": "Điểm Z-Score",
+            "status": "Đánh giá trạng thái",
+            "comment": "Nhận xét chi tiết",
+        },
+        use_container_width=True,
+        hide_index=True
+    )
 
 st.markdown("---")
 log_header_col1, log_header_col2 = st.columns([4, 1])
