@@ -47,12 +47,11 @@ if "log" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp Dữ liệu VN-Index - Lấy dữ liệu chuẩn từ DNSE (Đã sửa lỗi Timing Milliseconds)
+# Tích hợp Dữ liệu VN-Index từ DNSE API
 # ---------------------------------------------------------------------------
 def fetch_vnindex_yfinance() -> tuple[float, float]:
     """
     Tải lịch sử VN-Index từ DNSE Chart API v2.
-    Đã sửa lỗi Timing: Chuyển Timestamp sang Milliseconds (* 1000) để lấy đủ >200 phiên.
     """
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - (3 * 365 * 24 * 3600 * 1000)
@@ -94,7 +93,7 @@ def fetch_vnindex_yfinance() -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Tích hợp Google Gemini AI (Đã bật Google Search Grounding)
+# Tích hợp Google Gemini AI
 # ---------------------------------------------------------------------------
 GEMINI_FIELDS = [
     "pe_current", "pb_current", "rf", "dy_current",
@@ -103,14 +102,20 @@ GEMINI_FIELDS = [
 
 
 def get_available_gemini_model(encoded_key: str) -> str:
+    """Kiểm tra danh sách mô hình hỗ trợ generateContent khả dụng từ API Key."""
     list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={encoded_key}"
     req = urllib.request.Request(list_url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
             res = json.loads(response.read().decode("utf-8"))
             models = res.get("models", [])
+            
             priority_targets = [
-                "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash",
+                "gemini-2.5-flash", 
+                "gemini-2.0-flash", 
+                "gemini-1.5-flash",
+                "gemini-2.5-pro",
+                "gemini-1.5-pro"
             ]
             for target in priority_targets:
                 for m in models:
@@ -118,6 +123,7 @@ def get_available_gemini_model(encoded_key: str) -> str:
                     supported = m.get("supportedGenerationMethods", [])
                     if "generateContent" in supported and target in name:
                         return name.replace("models/", "")
+                        
             for m in models:
                 if "generateContent" in m.get("supportedGenerationMethods", []):
                     return m.get("name", "").replace("models/", "")
@@ -126,11 +132,12 @@ def get_available_gemini_model(encoded_key: str) -> str:
         raise Exception(f"Lỗi kiểm tra API Key ({err.code}): {err.reason}\n{err_body}")
     except Exception as exc:
         raise Exception(f"Không thể lấy danh sách Model Gemini: {exc}")
-    return "gemini-2.5-flash"
+        
+    return "gemini-2.0-flash"
 
 
 def fetch_market_data_via_gemini(api_key: str) -> dict:
-    # 1. Lấy giá thực tế từ DNSE API làm Neo Dữ Liệu (Ground Truth)
+    # 1. Lấy điểm chỉ số kỹ thuật từ DNSE
     dnse_price, dnse_ma200 = fetch_vnindex_yfinance()
 
     clean_key = api_key.strip()
@@ -139,27 +146,25 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={encoded_key}"
 
     prompt = f"""
-    Sử dụng công cụ tìm kiếm Google Search để tra cứu các báo cáo và số liệu mới nhất về Thị trường Chứng khoán Việt Nam (VN-Index) và Lợi suất Trái phiếu Chính phủ.
+    Sử dụng Google Search để tra cứu dữ liệu mới nhất về Thị trường Chứng khoán Việt Nam (VN-Index) và Lợi suất Trái phiếu Chính phủ.
 
-    Dữ liệu kỹ thuật từ sàn giao dịch hiện tại:
+    Dữ liệu giao dịch kỹ thuật cơ sở:
     - Giá VN-Index hiện tại: {dnse_price}
     - Đường MA200: {dnse_ma200}
 
-    Hãy tra cứu tin tức/báo cáo tài chính trực tuyến mới nhất và trả về ĐÚNG MỘT CHUỖI JSON thuần túy (không chứa ký tự markdown ```json) theo định dạng:
+    Trả về duy nhất MỘT CHUỖI JSON thuần túy (không chứa thêm bất kỳ từ ngữ hay cú pháp mã markdown nào) có dạng:
     {{
         "pe_current": float (P/E hiện tại của VN-Index),
         "pb_current": float (P/B hiện tại của VN-Index),
-        "rf": float (Lợi suất Trái phiếu Chính phủ Việt Nam kỳ hạn 10 năm - %),
-        "dy_current": float (Tỷ suất cổ tức Dividend Yield của VN-Index - %),
+        "rf": float (Lợi suất Trái phiếu Chính phủ Việt Nam 10 năm - %),
+        "dy_current": float (Tỷ suất cổ tức Dividend Yield hiện tại - %),
         "price_current": {dnse_price},
         "ma200": {dnse_ma200},
         "volatility_current": float (Biến động Volatility niên hóa hiện tại - %),
         "drawdown_pct": float (Mức sụt giảm Drawdown từ đỉnh gần nhất - %)
     }}
-    Chỉ trả về JSON duy nhất, không thêm bất kỳ văn bản nào khác.
     """
 
-    # Cấu hình Payload có bật tools google_search
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "tools": [{"google_search": {}}],
@@ -186,15 +191,15 @@ def fetch_market_data_via_gemini(api_key: str) -> dict:
         
     parts = candidates[0].get("content", {}).get("parts", [])
     
-    # Tìm đoạn text chứa JSON trong kết quả trả về
+    # Sửa lỗi bóc tách text: Lọc an toàn chỉ lấy các phần có thuộc tính "text"
     text_response = ""
-    for p in parts:
-        if "text" in p:
-            text_response += p["text"]
+    for part in parts:
+        if isinstance(part, dict) and "text" in part:
+            text_response += part["text"]
             
     text_response = text_response.strip()
 
-    # Làm sạch chuỗi JSON nếu Gemini gói vào markdown ```
+    # Xử lý cắt chuỗi JSON an toàn
     if "{" in text_response and "}" in text_response:
         start_idx = text_response.find("{")
         end_idx = text_response.rfind("}") + 1
