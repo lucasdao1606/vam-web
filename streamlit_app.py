@@ -1,4 +1,3 @@
-"""
 streamlit_app.py - VAM Portfolio Allocator (Web Edition)
 Phiên bản web của công cụ phân bổ danh mục đầu tư VAM (Valuation-based Asset Allocation).
 Tái sử dụng nguyên vẹn logic tính toán từ vam_core.py (không thay đổi công thức).
@@ -14,6 +13,7 @@ from datetime import datetime
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
+import yfinance as yf
 
 from vam_core import VAMInputs, compute
 from sheets_log import sheets_configured, append_log_row, load_log_df, make_log_row
@@ -46,9 +46,37 @@ for key, val in DEFAULTS.items():
 if "log" not in st.session_state:
     st.session_state.log = []  # fallback log tạm khi chưa cấu hình Google Sheets
 
+
+# ---------------------------------------------------------------------------
+# Tích hợp yfinance - Lấy giá hiện tại & MA200 cho VN-Index
+# ---------------------------------------------------------------------------
+def fetch_vnindex_yfinance() -> tuple[float, float]:
+    """Tải dữ liệu VN-Index từ Yahoo Finance và tính toán MA200"""
+    ticker = "^VNINDEX"
+    df = yf.download(ticker, period="1y", interval="1d", progress=False)
+    
+    if df.empty:
+        raise Exception("Không thể lấy dữ liệu từ Yahoo Finance.")
+        
+    # Xử lý trường hợp MultiIndex columns nếu yfinance trả về dạng bảng 2 tầng
+    if isinstance(df.columns, pd.MultiIndex):
+        close_series = df['Close'][ticker]
+    else:
+        close_series = df['Close']
+        
+    close_series = close_series.dropna()
+    
+    if len(close_series) < 200:
+        raise Exception("Dữ liệu lịch sử không đủ 200 phiên để tính MA200.")
+        
+    price_current = float(close_series.iloc[-1])
+    ma200 = float(close_series.rolling(window=200).mean().iloc[-1])
+    
+    return round(price_current, 2), round(ma200, 2)
+
+
 # ---------------------------------------------------------------------------
 # Tích hợp Google Gemini AI - tự động lấy dữ liệu thị trường VN-Index
-# (Giữ nguyên logic từ vam_app.py gốc, chuyển sang đồng bộ cho Streamlit)
 # ---------------------------------------------------------------------------
 GEMINI_FIELDS = [
     "pe_current", "pb_current", "rf", "dy_current",
@@ -198,6 +226,17 @@ with st.sidebar.expander("⚖️ Trọng số 4 thành phần (%)", expanded=Tru
     st.session_state.w_dy = st.number_input("Trọng số DY (w4)", 0.0, 100.0, st.session_state.w_dy, 1.0)
 
 with st.sidebar.expander("📉 Xu hướng & Rủi ro", expanded=False):
+    if st.button("📈 Lấy giá & MA200 từ yfinance", use_container_width=True):
+        with st.spinner("Đang tải dữ liệu VN-Index từ Yahoo Finance..."):
+            try:
+                p_curr, ma_val = fetch_vnindex_yfinance()
+                st.session_state.price_current = p_curr
+                st.session_state.ma200 = ma_val
+                st.success(f"Cập nhật thành công! Giá: {p_curr} | MA200: {ma_val}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Lỗi tải yfinance: {exc}")
+
     st.session_state.price_current = st.number_input("Giá hiện tại", 0.0, 1e7, st.session_state.price_current, 1.0)
     st.session_state.ma200 = st.number_input("MA200", 0.0, 1e7, st.session_state.ma200, 1.0)
     st.session_state.volatility_current = st.number_input(
