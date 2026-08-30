@@ -1,10 +1,11 @@
 """
-vam_core.py - VAM Core Logic Engine
-Thuật toán phân bổ danh mục đầu tư VAM (Valuation-based Asset Allocation).
-Tính toán điểm định giá Valuation Score (VS) và phân tích chi tiết từng tham số.
+vam_core.py - Động cơ tính toán VAM Score & Tra cứu Hiến Pháp Đầu Tư
 """
 
-from dataclasses import dataclass, field
+import json
+import os
+from dataclasses import dataclass
+from typing import Dict, Any, List, Optional
 
 
 @dataclass
@@ -13,6 +14,8 @@ class VAMInputs:
     saa_equity: float
     saa_gold: float
     saa_bond: float
+    
+    # Định giá
     pe_current: float
     pe_min: float
     pe_max: float
@@ -25,214 +28,180 @@ class VAMInputs:
     dy_current: float
     dy_min: float
     dy_max: float
+    
+    # Trọng số
     w_pe: float
     w_pb: float
     w_erp: float
     w_dy: float
-    price_current: float
-    ma200: float
-    volatility_current: float
-    volatility_avg: float
-    drawdown_pct: float
-    method: str
+    
+    # Chất lượng & Tăng trưởng
+    roe_current: float = 13.5
+    roe_benchmark: float = 12.0
+    eps_growth_exp: float = 10.0
+    eps_growth_benchmark: float = 8.0
+    
+    # Xu hướng Kỹ thuật
+    price_current: float = 1250.0
+    ma200: float = 1250.0
+    volatility_current: float = 15.0
+    volatility_avg: float = 15.0
+    drawdown_pct: float = 0.0
+    
+    # Vĩ mô Mỹ & Dynamic Gold
+    us10y: float = 4.2
+    us_cpi: float = 3.0
+    
+    method: str = "step"
 
 
 @dataclass
-class VAMOutputs:
+class VAMResult:
     valuation_score: float
-    equity_weight: float
-    bond_weight: float
-    gold_weight: float
     pe_score: float
     pb_score: float
     erp_score: float
     dy_score: float
-    overall_assessment: str = ""
-    overall_comment: str = ""
-    details: list[dict] = field(default_factory=list)
+    quality_adj: float
+    
+    equity_weight: float
+    bond_weight: float
+    gold_weight: float
+    
+    legal_basis: Dict[str, str]
+    rule_text: str
+    recommendation: Dict[str, Any]
+    details: List[Dict[str, Any]]
 
 
-def _assess_score(score: float, metric_name: str) -> tuple[str, str]:
-    """Phân loại trạng thái định giá dựa trên Z-Score chuẩn hóa."""
-    if score >= 0.5:
-        if metric_name in ["P/E", "P/B"]:
-            return "🟢 Rẻ (Tích cực)", "Định giá nằm ở vùng thấp so với lịch sử, mức giá hấp dẫn để tích lũy."
-        elif metric_name == "ERP":
-            return "🟢 Hấp dẫn (Tích cực)", "Phần bù rủi ro cổ phiếu cao, bù đắp tốt so với lợi suất TPCP."
-        else:  # DY
-            return "🟢 Cao (Tích cực)", "Tỷ suất cổ tức vượt mức trung bình, dòng tiền cổ tức tốt."
-    elif score <= -0.5:
-        if metric_name in ["P/E", "P/B"]:
-            return "🔴 Đắt (Tiêu cực)", "Định giá nằm ở vùng cao so với lịch sử, tiềm ẩn rủi ro điều chỉnh."
-        elif metric_name == "ERP":
-            return "🔴 Kém (Tiêu cực)", "Phần bù rủi ro mỏng so với TPCP, rủi ro/lợi nhuận không hấp dẫn."
-        else:  # DY
-            return "🔴 Thấp (Tiêu cực)", "Tỷ suất cổ tức kém hấp dẫn so với lịch sử."
-    else:
-        return "🟡 Trung vị (Cân bằng)", "Định giá xoay quanh mức trung bình lịch sử, thị trường ở mức cân bằng."
+def clamp(val: float, min_val: float, max_val: float) -> float:
+    return max(min_val, min(max_val, val))
 
 
-def _assess_overall_vs(vs: float) -> tuple[str, str]:
-    """Đánh giá nhận xét tổng quan dựa trên điểm Valuation Score (VS)."""
-    if vs >= 1.0:
-        return "🟢 Định giá Rất Rẻ (Tăng tỷ trọng mạnh)", "Thị trường đang ở vùng định giá rất hấp dẫn. Khuyến nghị gia tăng tối đa tỷ trọng Cổ phiếu so với SAA chuẩn."
-    elif vs >= 0.3:
-        return "🟢 Định giá Hấp Dẫn (Tăng tỷ trọng nhẹ)", "Thị trường đang rẻ hơn trung bình lịch sử. Khuyến nghị tăng nhẹ tỷ trọng Cổ phiếu."
-    elif vs <= -1.0:
-        return "🔴 Định giá Rất Đắt (Hạ tỷ trọng mạnh)", "Thị trường đang ở mức định giá rất cao/rủi ro. Khuyến nghị hạ mạnh tỷ trọng Cổ phiếu về mức an toàn và gia tăng Trái phiếu/Tiền mặt."
-    elif vs <= -0.3:
-        return "🔴 Định giá Cao (Hạ tỷ trọng nhẹ)", "Thị trường đang cao hơn mức cân bằng. Khuyến nghị giảm nhẹ tỷ trọng Cổ phiếu để quản trị rủi ro."
-    else:
-        return "🟡 Định giá Cân Bằng (Giữ SAA chuẩn)", "Thị trường đang phản ánh đúng giá trị trung bình lịch sử. Khuyến nghị duy trì tỷ trọng phân bổ Cổ phiếu theo SAA cơ sở."
+def compute_z_score(val: float, min_val: float, max_val: float, reverse: bool = False) -> float:
+    if max_val == min_val:
+        return 0.0
+    mid = (min_val + max_val) / 2.0
+    half_range = (max_val - min_val) / 2.0
+    score = (val - mid) / half_range * 2.0
+    score = clamp(score, -2.0, 2.0)
+    return -score if reverse else score
 
 
-def compute(inputs: VAMInputs) -> VAMOutputs:
-    """Hàm tính toán chính của mô hình VAM."""
+def load_constitution(json_path: str = "investment_constitution.json") -> Optional[Dict[str, Any]]:
+    if not os.path.exists(json_path):
+        return None
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    # 1. P/E Score
-    pe_score = 0.0
-    if inputs.pe_max > inputs.pe_min:
-        mid_pe = (inputs.pe_max + inputs.pe_min) / 2.0
-        sigma_pe = (inputs.pe_max - inputs.pe_min) / 4.0
-        if sigma_pe > 0:
-            pe_score = -((inputs.pe_current - mid_pe) / sigma_pe)
 
-    # 2. P/B Score
-    pb_score = 0.0
-    if inputs.pb_max > inputs.pb_min:
-        mid_pb = (inputs.pb_max + inputs.pb_min) / 2.0
-        sigma_pb = (inputs.pb_max - inputs.pb_min) / 4.0
-        if sigma_pb > 0:
-            pb_score = -((inputs.pb_current - mid_pb) / sigma_pb)
+def query_constitution(vam_score: float, constitution: Optional[Dict[str, Any]]) -> tuple[Dict[str, str], str, Dict[str, Any]]:
+    default_basis = {"chapter": "Chương 2: Quy tắc phân bổ", "article": "Điều 3: Phân bổ Cổ phiếu", "clause": "Khoản 3.3: Định giá Cân bằng"}
+    default_rule = "Giữ nguyên tỷ trọng Cổ phiếu theo SAA cơ sở."
+    default_rec = {
+        "action": "HOLD_REBALANCE",
+        "headline": "Duy trì danh mục cân bằng",
+        "detail": "Thị trường ở vùng trung tính, duy trì phân bổ mục tiêu."
+    }
+    
+    if not constitution:
+        return default_basis, default_rule, default_rec
 
-    # 3. ERP Score
-    ep = (1.0 / inputs.pe_current * 100.0) if inputs.pe_current > 0 else 0.0
-    erp = ep - inputs.rf
-    erp_score = 0.0
-    if inputs.erp_max > inputs.erp_min:
-        mid_erp = (inputs.erp_max + inputs.erp_min) / 2.0
-        sigma_erp = (inputs.erp_max - inputs.erp_min) / 4.0
-        if sigma_erp > 0:
-            erp_score = (erp - mid_erp) / sigma_erp
+    try:
+        chap_2 = next(c for c in constitution["chapters"] if c["chapter_id"] == 2)
+        art_3 = next(a for a in chap_2["articles"] if a["article_id"] == 3)
+        
+        matched_clause = None
+        for clause in art_3["clauses"]:
+            if clause["min_score"] <= vam_score <= clause["max_score"]:
+                matched_clause = clause
+                break
+                
+        if not matched_clause:
+            matched_clause = art_3["clauses"][0] if vam_score > 0 else art_3["clauses"][-1]
 
-    # 4. DY Score
-    dy_score = 0.0
-    if inputs.dy_max > inputs.dy_min:
-        mid_dy = (inputs.dy_max + inputs.dy_min) / 2.0
-        sigma_dy = (inputs.dy_max - inputs.dy_min) / 4.0
-        if sigma_dy > 0:
-            dy_score = (inputs.dy_current - mid_dy) / sigma_dy
+        legal_basis = {
+            "chapter": f"Chương {chap_2['chapter_id']}: {chap_2['chapter_name']}",
+            "article": f"Điều {art_3['article_id']}: {art_3['article_name']}",
+            "clause": f"Khoản {matched_clause['clause_id']}: {matched_clause['title']}"
+        }
+        
+        return legal_basis, matched_clause["rule"], matched_clause["recommendation"]
+    except Exception:
+        return default_basis, default_rule, default_rec
 
-    # Tổng hợp Valuation Score (VS)
+
+def compute(inputs: VAMInputs, constitution_path: str = "investment_constitution.json") -> VAMResult:
+    # 1. Z-Scores
+    pe_score = compute_z_score(inputs.pe_current, inputs.pe_min, inputs.pe_max, reverse=True)
+    pb_score = compute_z_score(inputs.pb_current, inputs.pb_min, inputs.pb_max, reverse=True)
+    erp_curr = (100.0 / inputs.pe_current) - inputs.rf if inputs.pe_current > 0 else 0.0
+    erp_score = compute_z_score(erp_curr, inputs.erp_min, inputs.erp_max, reverse=False)
+    dy_score = compute_z_score(inputs.dy_current, inputs.dy_min, inputs.dy_max, reverse=False)
+    
+    # 2. Quality Adj
+    roe_diff = inputs.roe_current - inputs.roe_benchmark
+    eps_diff = inputs.eps_growth_exp - inputs.eps_growth_benchmark
+    quality_adj = clamp((roe_diff * 0.05) + (eps_diff * 0.03), -0.5, 0.5)
+    
+    # 3. VAM Score
     total_w = inputs.w_pe + inputs.w_pb + inputs.w_erp + inputs.w_dy
-    if total_w > 0:
-        vs = (
-            pe_score * inputs.w_pe
-            + pb_score * inputs.w_pb
-            + erp_score * inputs.w_erp
-            + dy_score * inputs.w_dy
-        ) / total_w
+    if total_w <= 0: total_w = 100.0
+    
+    raw_vs = (pe_score * inputs.w_pe + pb_score * inputs.w_pb + erp_score * inputs.w_erp + dy_score * inputs.w_dy) / total_w
+    valuation_score = clamp(raw_vs + quality_adj, -2.0, 2.0)
+    
+    # 4. Dynamic Gold
+    us_real_yield = inputs.us10y - inputs.us_cpi
+    delta_gold_tech = 0.0
+    if inputs.price_current < inputs.ma200 or inputs.drawdown_pct > 15.0:
+        delta_gold_tech += 5.0
+    if inputs.volatility_current > inputs.volatility_avg * 1.2:
+        delta_gold_tech += 2.5
+    elif inputs.price_current >= inputs.ma200 and inputs.volatility_current <= inputs.volatility_avg:
+        delta_gold_tech -= 2.5
+        
+    delta_gold_macro = 0.0
+    if us_real_yield < 0.0:
+        delta_gold_macro += 5.0
+    elif us_real_yield < 1.5:
+        delta_gold_macro += 2.5
+    elif us_real_yield >= 3.0:
+        delta_gold_macro -= 5.0
+        
+    gold_weight = clamp(inputs.saa_gold + delta_gold_tech + delta_gold_macro, 5.0, 25.0)
+    gold_diff = gold_weight - inputs.saa_gold
+    
+    # 5. Phân bổ Cổ phiếu & Trái phiếu
+    base_equity = inputs.saa_equity
+    if inputs.method == "step":
+        if valuation_score >= 1.0: equity_shift = 15.0
+        elif valuation_score >= 0.5: equity_shift = 7.5
+        elif valuation_score <= -1.0: equity_shift = -15.0
+        elif valuation_score <= -0.5: equity_shift = -7.5
+        else: equity_shift = 0.0
     else:
-        vs = 0.0
-
-    vs = max(-2.0, min(2.0, vs))
-
-    # TAA Delta và Tỷ trọng tài sản
-    taa_delta = vs * 10.0
-    eq_weight = max(10.0, min(90.0, inputs.saa_equity + taa_delta))
-    gold_weight = inputs.saa_gold
-    bond_weight = max(0.0, 100.0 - eq_weight - gold_weight)
-
-    # Nhận xét tổng quan VAM Score
-    overall_assessment, overall_comment = _assess_overall_vs(vs)
-
-    # Đánh giá 4 chỉ số định giá
-    pe_status, pe_comm = _assess_score(pe_score, "P/E")
-    pb_status, pb_comm = _assess_score(pb_score, "P/B")
-    erp_status, erp_comm = _assess_score(erp_score, "ERP")
-    dy_status, dy_comm = _assess_score(dy_score, "DY")
-
-    # Tính độ lệch định lượng cho MA200 và Volatility
-    ma_diff_pct = ((inputs.price_current - inputs.ma200) / inputs.ma200) * 100.0 if inputs.ma200 > 0 else 0.0
-    vol_diff_pct = inputs.volatility_current - inputs.volatility_avg
-
-    # Đánh giá Xu hướng MA200
-    if inputs.price_current >= inputs.ma200:
-        ma_status = "🟢 Uptrend (Tích cực)"
-        ma_comm = f"Giá cao hơn MA200 {ma_diff_pct:+.1f}%, duy trì xu hướng tăng dài hạn."
-    else:
-        ma_status = "🔴 Downtrend (Tiêu cực)"
-        ma_comm = f"Giá thấp hơn MA200 {ma_diff_pct:+.1f}%, xu hướng dài hạn suy yếu."
-
-    # Đánh giá Mức biến động (Volatility)
-    if inputs.volatility_current <= inputs.volatility_avg:
-        vol_status = "🟢 Ôn hòa (Tích cực)"
-        vol_comm = f"Biến động thấp hơn TB {vol_diff_pct:+.1f}%, tâm lý thị trường ổn định."
-    else:
-        vol_status = "🟡 Cao (Cảnh báo)"
-        vol_comm = f"Biến động cao hơn TB {vol_diff_pct:+.1f}%, rủi ro biến động giá tăng."
-
+        equity_shift = valuation_score * 10.0
+        
+    raw_equity_weight = clamp(base_equity + equity_shift, 10.0, 90.0)
+    equity_weight = clamp(raw_equity_weight - (gold_diff * 0.5), 5.0, 90.0)
+    bond_weight = clamp(100.0 - equity_weight - gold_weight, 0.0, 90.0)
+    
+    # 6. Tra cứu Hiến Pháp
+    constitution = load_constitution(constitution_path)
+    legal_basis, rule_text, recommendation = query_constitution(valuation_score, constitution)
+    
     details = [
-        {
-            "parameter": "Định giá P/E",
-            "current_value": f"{inputs.pe_current:.2f}",
-            "benchmark_range": f"Min: {inputs.pe_min} - Max: {inputs.pe_max}",
-            "z_score": f"{pe_score:+.2f}",
-            "status": pe_status,
-            "comment": pe_comm,
-        },
-        {
-            "parameter": "Định giá P/B",
-            "current_value": f"{inputs.pb_current:.2f}",
-            "benchmark_range": f"Min: {inputs.pb_min} - Max: {inputs.pb_max}",
-            "z_score": f"{pb_score:+.2f}",
-            "status": pb_status,
-            "comment": pb_comm,
-        },
-        {
-            "parameter": "Phần bù rủi ro (ERP)",
-            "current_value": f"{erp:.2f}%",
-            "benchmark_range": f"Min: {inputs.erp_min}% - Max: {inputs.erp_max}%",
-            "z_score": f"{erp_score:+.2f}",
-            "status": erp_status,
-            "comment": erp_comm,
-        },
-        {
-            "parameter": "Tỷ suất cổ tức (DY)",
-            "current_value": f"{inputs.dy_current:.2f}%",
-            "benchmark_range": f"Min: {inputs.dy_min}% - Max: {inputs.dy_max}%",
-            "z_score": f"{dy_score:+.2f}",
-            "status": dy_status,
-            "comment": dy_comm,
-        },
-        {
-            "parameter": "Xu hướng (MA200)",
-            "current_value": f"{inputs.price_current:.1f}",
-            "benchmark_range": f"MA200: {inputs.ma200:.1f}",
-            "z_score": f"{ma_diff_pct:+.1f}%",
-            "status": ma_status,
-            "comment": ma_comm,
-        },
-        {
-            "parameter": "Mức biến động (Vol)",
-            "current_value": f"{inputs.volatility_current:.1f}%",
-            "benchmark_range": f"TB Lịch sử: {inputs.volatility_avg:.1f}%",
-            "z_score": f"{vol_diff_pct:+.1f}%",
-            "status": vol_status,
-            "comment": vol_comm,
-        },
+        {"parameter": "P/E", "current_value": f"{inputs.pe_current:.2f}", "z_score": f"{pe_score:+.2f}"},
+        {"parameter": "P/B", "current_value": f"{inputs.pb_current:.2f}", "z_score": f"{pb_score:+.2f}"},
+        {"parameter": "ERP", "current_value": f"{erp_curr:.2f}%", "z_score": f"{erp_score:+.2f}"},
+        {"parameter": "DY", "current_value": f"{inputs.dy_current:.2f}%", "z_score": f"{dy_score:+.2f}"},
+        {"parameter": "US Real Yield", "current_value": f"{us_real_yield:.2f}%", "z_score": f"Gold Adj: {delta_gold_macro:+.1f}%"}
     ]
 
-    return VAMOutputs(
-        valuation_score=round(vs, 4),
-        equity_weight=round(eq_weight, 2),
-        bond_weight=round(bond_weight, 2),
-        gold_weight=round(gold_weight, 2),
-        pe_score=round(pe_score, 2),
-        pb_score=round(pb_score, 2),
-        erp_score=round(erp_score, 2),
-        dy_score=round(dy_score, 2),
-        overall_assessment=overall_assessment,
-        overall_comment=overall_comment,
-        details=details,
+    return VAMResult(
+        valuation_score=valuation_score, pe_score=pe_score, pb_score=pb_score,
+        erp_score=erp_score, dy_score=dy_score, quality_adj=quality_adj,
+        equity_weight=equity_weight, bond_weight=bond_weight, gold_weight=gold_weight,
+        legal_basis=legal_basis, rule_text=rule_text, recommendation=recommendation, details=details
     )

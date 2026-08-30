@@ -1,0 +1,173 @@
+{
+  "constitution_metadata": {
+    "title": "HIẾN PHÁP ĐẦU TƯ TÀI SẢN DÀI HẠN (VAM CONSTITUTION)",
+    "version": "2.0",
+    "philosophy": "Đầu tư dài hạn, tập trung vào giá trị, phân bổ tài sản động theo định giá vĩ mô và quản trị rủi ro nghiêm ngặt.",
+    "effective_date": "2026-01-01"
+  },
+  "chapters": [
+    {
+      "chapter_id": 1,
+      "chapter_name": "TƯ TƯỞNG CỐT LÕI VÀ NGUYÊN TẮC NỀN TẢNG",
+      "articles": [
+        {
+          "article_id": 1,
+          "article_name": "Triết lý Đầu tư Dài hạn",
+          "clauses": [
+            {
+              "clause_id": "1.1",
+              "text": "Thị trường trong ngắn hạn là một máy bình chọn, nhưng trong dài hạn là một cái cân. Mọi quyết định giải ngân phải dựa trên định giá và chất lượng nội tại, tuyệt đối không đầu cơ theo tâm lý đám đông."
+            },
+            {
+              "clause_id": "1.2",
+              "text": "Tài sản cơ sở được phân bổ dựa trên khung SAA (Strategic Asset Allocation) theo độ tuổi và khả năng chịu đựng rủi ro, kết hợp với TAA (Tactical Asset Allocation) co giãn theo điểm định giá VAM Score."
+            }
+          ]
+        },
+        {
+          "article_id": 2,
+          "article_name": "Nguyên tắc Bảo toàn Vốn và Biên độ An toàn",
+          "clauses": [
+            {
+              "clause_id": "2.1",
+              "text": "Quy tắc số 1: Không để mất tiền. Quy tắc số 2: Không bao giờ quên Quy tắc số 1."
+            },
+            {
+              "clause_id": "2.2",
+              "text": "Chỉ gia tăng tỷ trọng Cổ phiếu vượt mức SAA cơ sở khi thị trường có Biên độ An toàn (Margin of Safety) rõ ràng, thể hiện qua VAM Score đạt mức Tích cực hoặc Rất rẻ."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chapter_id": 2,
+      "chapter_name": "QUY TẮC PHÂN BỔ TÀI SẢN THEO ĐIỂM ĐỊNH GIÁ (VAM SCORE)",
+      "articles": [
+        {
+          "article_id": 3,
+          "article_name": "Khung Hành động Phân bổ Tài sản Cổ phiếu",
+          "clauses": [
+            {
+              "clause_id": "3.1",
+              "score_band": "VERY_CHEAP",
+              "min_score": 1.0,
+              "max_score": 2.0,
+              "title": "Vùng Định giá Rất Rẻ (Hấp dẫn Tuyệt đối)",
+              "rule": "Tăng tối đa tỷ trọng Cổ phiếu thêm +15.0% so với SAA nền tảng.",
+              "recommendation": {
+                "action": "BUY_AGGRESSIVE",
+                "headline": "Cơ hội tích lũy tài sản lịch sử",
+                "detail": "Thị trường đang bị định giá thấp chiết khấu sâu. Cần chủ động giải ngân quyết liệt, dồn vốn từ Trái phiếu/Tiền mặt sang Cổ phiếu chất lượng cao.",
+                "tactical_shift": { "equity_delta": 15.0, "bond_delta": -15.0, "gold_delta": 0.0 }
+              }
+            },
+            {
+              "clause_id": "3.2",
+              "score_band": "CHEAP",
+              "min_score": 0.5,
+              "max_score": 0.999,
+              "title": "Vùng Định giá Rẻ (Hấp dẫn)",
+              "rule": "Tăng nhẹ tỷ trọng Cổ phiếu thêm +7.5% so với SAA nền tảng.",
+              "recommendation": {
+                "action": "BUY_ACCUMULATE",
+                "headline": "Gia tăng tỷ trọng Cổ phiếu theo kế hoạch",
+                "detail": "Định giá thị trường đang ở mức rẻ hơn trung bình lịch sử. Thực hiện tích lũy định kỳ và phân bổ thêm vốn vào các ngành có ROE và tăng trưởng EPS vượt trội.",
+                "tactical_shift": { "equity_delta": 7.5, "bond_delta": -7.5, "gold_delta": 0.0 }
+              }
+            },
+            {
+              "clause_id": "3.3",
+              "score_band": "NEUTRAL",
+              "min_score": -0.499,
+              "max_score": 0.499,
+              "title": "Vùng Định giá Cân bằng (Hợp lý)",
+              "rule": "Giữ nguyên tỷ trọng Cổ phiếu theo SAA cơ sở (Shift = 0.0%).",
+              "recommendation": {
+                "action": "HOLD_REBALANCE",
+                "headline": "Duy trì danh mục cân bằng",
+                "detail": "Thị trường đang phản ánh đúng giá trị thực. Duy trì tỷ trọng danh mục chuẩn theo độ tuổi, thực hiện tái cân bằng nếu có tài sản lệch quá 5% so với mục tiêu.",
+                "tactical_shift": { "equity_delta": 0.0, "bond_delta": 0.0, "gold_delta": 0.0 }
+              }
+            },
+            {
+              "clause_id": "3.4",
+              "score_band": "EXPENSIVE",
+              "min_score": -0.999,
+              "max_score": -0.5,
+              "title": "Vùng Định giá Đắt (Cảnh báo)",
+              "rule": "Giảm tỷ trọng Cổ phiếu -7.5% so với SAA nền tảng.",
+              "recommendation": {
+                "action": "REDUCE_RISK",
+                "headline": "Chủ động hiện thực hóa một phần lợi nhuận",
+                "detail": "Thị trường đang tiến vào vùng định giá cao. Chủ động hạ tỷ trọng các cổ phiếu speculative, chốt lời từng phần và chuyển dịch dòng tiền sang Trái phiếu phòng thủ.",
+                "tactical_shift": { "equity_delta": -7.5, "bond_delta": 7.5, "gold_delta": 0.0 }
+              }
+            },
+            {
+              "clause_id": "3.5",
+              "score_band": "VERY_EXPENSIVE",
+              "min_score": -2.0,
+              "max_score": -1.0,
+              "title": "Vùng Định giá Rất Đắt (Rủi ro Rất cao)",
+              "rule": "Giảm tối đa tỷ trọng Cổ phiếu -15.0% so với SAA nền tảng.",
+              "recommendation": {
+                "action": "DEFENSIVE_MAX",
+                "headline": "Phòng thủ tuyệt đối và quản trị rủi ro nghiêm ngặt",
+                "detail": "Rủi ro Bong bóng định giá. Cần siết chặt kỷ luật, hạ tỷ trọng Cổ phiếu xuống mức tối thiểu an toàn, gia tăng tối đa tài sản an toàn (Trái phiếu/Tiền gửi).",
+                "tactical_shift": { "equity_delta": -15.0, "bond_delta": 15.0, "gold_delta": 0.0 }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chapter_id": 3,
+      "chapter_name": "QUY TẮC QUẢN TRỊ RỦI RO KỸ THUẬT VÀ TÀI SẢN TRÚ ẨN (VÀNG)",
+      "articles": [
+        {
+          "article_id": 4,
+          "article_name": "Nguyên tắc Điều chỉnh Tỷ trọng Vàng Động (Dynamic Gold)",
+          "clauses": [
+            {
+              "clause_id": "4.1",
+              "condition": "TECHNICAL_RISK",
+              "text": "Khi Giá VN-Index gãy đường xu hướng MA200 hoặc Drawdown vượt quá 15%, gia tăng ngay +5.0% tỷ trọng Vàng phòng hộ kỹ thuật."
+            },
+            {
+              "clause_id": "4.2",
+              "condition": "MACRO_INFLATION_RISK",
+              "text": "Khi Lợi suất thực Mỹ (US Real Yield = US10Y - US_CPI) bị âm (chuyển sang trạng thái Lạm phát cao), gia tăng thêm +5.0% tỷ trọng Vàng phòng hộ lạm phát."
+            },
+            {
+              "clause_id": "4.3",
+              "condition": "GOLD_LIMITS",
+              "text": "Tỷ trọng Vàng trong toàn bộ danh mục bất kể trong mọi hoàn cảnh phải luôn được giữ trong dải khống chế từ 5.0% (Sàn) đến 25.0% (Trần)."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chapter_id": 4,
+      "chapter_name": "KỶ LUẬT TÁI CÂN BẰNG VÀ ĐIỀU KIỆN VI PHẠM",
+      "articles": [
+        {
+          "article_id": 5,
+          "article_name": "Kỷ luật Giao dịch và Tái cân bằng",
+          "clauses": [
+            {
+              "clause_id": "5.1",
+              "text": "Danh mục chỉ được thực hiện tái cân bằng khi điểm định giá VAM Score dịch chuyển sang phân vùng mới hoặc khi tỷ trọng thực tế lệch quá 5% so với tỷ trọng khuyến nghị."
+            },
+            {
+              "clause_id": "5.2",
+              "text": "Nghiêm cấm việc mua bán liên tục theo sóng ngắn hạn. Mọi hành vi điều chỉnh danh mục phải có căn cứ rõ ràng theo Chương 2 và Chương 3 của Hiến pháp này."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
