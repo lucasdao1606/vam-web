@@ -1,17 +1,16 @@
 """
 streamlit_app.py - VAM Portfolio Allocator (Web Edition)
-Công cụ phân bổ danh mục đầu tư động theo mô hình VAM.
+Công cụ phân bổ danh mục đầu tư động tích hợp vnstock & Gemini AI.
 Chạy ứng dụng: streamlit run streamlit_app.py
 """
 
 import json
+import re
 import time
-import urllib.request
-import urllib.parse
-import urllib.error
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -29,7 +28,7 @@ st.set_page_config(
 
 SHEETS_ON = sheets_configured()
 
-# Giá trị mặc định ban đầu
+# Giá trị mặc định chuẩn hóa ban đầu
 DEFAULTS = {
     "age": 40,
     "pe_current": 14.2, "pe_min": 10.0, "pe_max": 20.0,
@@ -59,8 +58,179 @@ if "show_constitution" not in st.session_state:
     st.session_state.show_constitution = False
 
 
+# ---------------------------------------------------------------------------
+# 1. Hàm lấy dữ liệu vnstock (Chỉ lấy các chỉ số chứng khoán & VN30)
+# ---------------------------------------------------------------------------
+def fetch_vnstock_market_data(progress_bar, status_box) -> dict:
+    try:
+        from vnstock import Reference, Fundamental, Quote
+    except ImportError:
+        st.error("⚠️ Thư viện `vnstock` chưa được cài đặt! Hãy chạy: `pip install vnstock`")
+        return {}
+
+    results = {}
+    
+    # Kỹ thuật VN-Index
+    status_box.update(label="📈 Đang tải & chuẩn hóa chuỗi giá VN-Index...", state="running")
+    progress_bar.progress(5)
+    try:
+        end_d = date.today()
+        start_d = end_d - timedelta(days=365)
+        
+        quote_idx = Quote(symbol="VNINDEX", source="VCI")
+        df_idx = quote_idx.history(start=start_d.isoformat(), end=end_d.isoformat(), interval="1D")
+        
+        if df_idx is not None and not df_idx.empty:
+            cot_close = "close" if "close" in df_idx.columns else df_idx.columns[-2]
+            close_prices = df_idx[cot_close].dropna()
+            
+            if close_prices.iloc[-1] < 200:
+                close_prices = close_prices * 1000
+                
+            p_curr = float(close_prices.iloc[-1])
+            ma200_val = float(close_prices.iloc[-200:].mean()) if len(close_prices) >= 200 else float(close_prices.mean())
+            
+            returns = close_prices.pct_change().dropna()
+            vol_curr = float(returns.std() * np.sqrt(252) * 100)
+            
+            peak = close_prices.cummax()
+            dd = (close_prices - peak) / peak
+            drawdown_val = float(abs(dd.min()) * 100)
+
+            results["price_current"] = round(p_curr, 1)
+            results["ma200"] = round(ma200_val, 1)
+            results["volatility_current"] = round(vol_curr, 1)
+            results["drawdown_pct"] = round(drawdown_val, 1)
+    except Exception as e:
+        st.warning(f"Không thể tính chỉ số kỹ thuật VNINDEX từ vnstock: {e}")
+
+    # Tài chính rổ VN30
+    status_box.update(label="📋 Đang lấy danh sách mã rổ VN30...", state="running")
+    progress_bar.progress(10)
+    try:
+        ref = Reference()
+        ket_qua_ref = ref.index.members(symbol="VN30")
+        if isinstance(ket_qua_ref, pd.DataFrame):
+            cot_symbol = next((c for c in ["symbol", "ticker", "stock_code", "code"] if c in ket_qua_ref.columns), ket_qua_ref.columns[0])
+            danh_sach_ma = ket_qua_ref[cot_symbol].tolist()
+        else:
+            danh_sach_ma = list(ket_qua_ref)
+    except Exception as e:
+        st.error(f"Lỗi lấy danh sách VN30: {e}")
+        return results
+
+    tong_ma = len(danh_sach_ma)
+    fa = Fundamental()
+    list_pe, list_pb, list_roe = [], [], []
+
+    ITEM_EPS = "trailing_eps"
+    ITEM_ROE = "roe_trailling"
+    ITEM_BVPS = "book_value_per_share_bvps"
+
+    status_box.update(label=f"🔄 Đang xử lý dữ liệu cho {tong_ma} mã VN30 (Chờ 10s/mã)...", state="running")
+
+    for idx, ma in enumerate(danh_sach_ma, start=1):
+        percent_done = int(10 + (idx / tong_ma) * 85)
+        progress_bar.progress(percent_done)
+        status_box.write(f"⏳ [{idx}/{tong_ma}] Đang phân tích mã **{ma}**...")
+
+        try:
+            df_ratio = fa.equity(ma).ratio(period="quarter")
+            if df_ratio is not None and not df_ratio.empty:
+                cols_ky = [c for c in df_ratio.columns if re.match(r"\d{4}-Q\d", str(c))]
+                if cols_ky:
+                    cols_ky.sort(key=lambda x: (int(x.split("-")[0]), int(x.split("-")[1].replace("Q", ""))), reverse=True)
+                    cot_gan = cols_ky[0]
+
+                    r_eps = df_ratio[df_ratio.get("item_id", pd.Series()) == ITEM_EPS]
+                    r_roe = df_ratio[df_ratio.get("item_id", pd.Series()) == ITEM_ROE]
+                    r_bvps = df_ratio[df_ratio.get("item_id", pd.Series()) == ITEM_BVPS]
+
+                    eps_val = float(r_eps[cot_gan].values[0]) if not r_eps.empty else None
+                    roe_val = float(r_roe[cot_gan].values[0]) if not r_roe.empty else None
+                    bvps_val = float(r_bvps[cot_gan].values[0]) if not r_bvps.empty else None
+
+                    q = Quote(symbol=ma, source="VCI")
+                    df_q = q.history(start=(date.today()-timedelta(weeks=4)).isoformat(), end=date.today().isoformat(), interval="1W")
+                    if df_q is not None and not df_q.empty:
+                        cot_g = "close" if "close" in df_q.columns else df_q.columns[-2]
+                        gia_raw = float(df_q.iloc[-1][cot_g])
+                        gia_dong = gia_raw * 1000 if gia_raw < 2000 else gia_raw
+
+                        if eps_val and eps_val > 0:
+                            pe_calc = gia_dong / eps_val
+                            if 1.0 <= pe_calc <= 70.0: list_pe.append(pe_calc)
+
+                        if bvps_val and bvps_val > 0:
+                            pb_calc = gia_dong / bvps_val
+                            if 0.2 <= pb_calc <= 15.0: list_pb.append(pb_calc)
+
+                        if roe_val is not None:
+                            roe_norm = roe_val * 100.0 if abs(roe_val) <= 1.0 else roe_val
+                            if -50.0 <= roe_norm <= 100.0: list_roe.append(roe_norm)
+        except Exception:
+            pass
+
+        time.sleep(10.0)
+
+    if list_pe: results["pe_current"] = round(float(np.median(list_pe)), 2)
+    if list_pb: results["pb_current"] = round(float(np.median(list_pb)), 2)
+    if list_roe: results["roe_current"] = round(float(np.median(list_roe)), 2)
+
+    progress_bar.progress(100)
+    status_box.update(label="✅ Hoàn tất lấy dữ liệu từ vnstock!", state="complete", expanded=False)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 2. Hàm Gemini AI - LẤY THAM SỐ VĨ MÔ/DỰ BÁO CÒN THIẾU
+# ---------------------------------------------------------------------------
+MISSING_PARAMS_KEYS = ["rf", "us10y", "us_cpi", "eps_growth_exp", "volatility_avg"]
+
+def fetch_missing_params_via_gemini(api_key: str) -> dict:
+    """
+    Sử dụng Gemini API (SDK google-genai) với mô hình gemini-3.6-flash
+    để truy xuất CHỈ CÁC THAM SỐ VĨ MÔ & DỰ BÁO mà vnstock không hỗ trợ.
+    """
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        st.error("⚠️ Chưa cài đặt thư viện `google-genai`. Hãy chạy: `pip install google-genai`")
+        return {}
+
+    client = genai.Client(api_key=api_key.strip())
+
+    prompt = """
+    Bạn là một chuyên gia dữ liệu tài chính. Hãy cập nhật các thông số vĩ mô và dự báo mới nhất tính đến hiện tại.
+    Chỉ trả về DUY NHẤT một chuỗi JSON thuần túy chứa các tham số dưới đây (tính bằng phần trăm %):
+
+    {
+        "rf": float (Lợi suất Trái phiếu Chính phủ Việt Nam kỳ hạn 10 năm - VN10Y, dùng làm lãi suất phi rủi ro Rf để tính ERP, ví dụ: 2.75),
+        "us10y": float (Lợi suất Trái phiếu Chính phủ Mỹ kỳ hạn 10 năm - US10Y, ví dụ: 4.25),
+        "us_cpi": float (Mức lạm phát CPI Mỹ tính theo năm mới nhất, ví dụ: 2.9),
+        "eps_growth_exp": float (Dự phóng mức tăng trưởng EPS bình quân rổ VN30/VN-Index trong 12 tháng tới %, ví dụ: 10.5),
+        "volatility_avg": float (Mức độ biến động Volatility trung bình dài hạn của VN-Index %, ví dụ: 17.5)
+    }
+    """
+
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
+    )
+
+    text_response = response.text.strip()
+    if "{" in text_response and "}" in text_response:
+        text_response = text_response[text_response.find("{"):text_response.rfind("}") + 1]
+
+    return json.loads(text_response)
+
+
 def draw_plotly_pie_chart(weights, labels, colors):
-    """Tạo biểu đồ đĩa tròn Donut tương tác bằng Plotly."""
     fig = go.Figure(
         data=[
             go.Pie(
@@ -89,103 +259,12 @@ def draw_plotly_pie_chart(weights, labels, colors):
     return fig
 
 
-def fetch_vndirect_market_data() -> dict:
-    url = "https://finfo-api.vndirect.com.vn/v2/disclosures?q=code:VNINDEX~type:RATIO&sort=reportDate:desc&size=1"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://dstock.vndirect.com.vn",
-        "Referer": "https://dstock.vndirect.com.vn/",
-    }
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as response:
-            res = json.loads(response.read().decode("utf-8"))
-            data_list = res.get("data", [])
-            if data_list:
-                item = data_list[0]
-                result = {}
-                if item.get("pe") is not None: result["pe_current"] = float(item["pe"])
-                if item.get("pb") is not None: result["pb_current"] = float(item["pb"])
-                if item.get("dividendYield") is not None:
-                    dy = float(item["dividendYield"])
-                    result["dy_current"] = dy * 100.0 if dy <= 1.0 else dy
-                return result
-    except Exception as e:
-        st.error(f"Lỗi truy xuất VNDirect: {e}")
-    return {}
-
-
-def fetch_vnindex_yfinance() -> tuple[float, float]:
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - (3 * 365 * 24 * 3600 * 1000)
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-    close_prices = []
-    try:
-        dnse_url = f"https://services.entrade.com.vn/chart-api/v2/ohlc/stock?from={start_ms}&to={now_ms}&symbol=VNINDEX&resolution=1D"
-        req = urllib.request.Request(dnse_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as response:
-            res = json.loads(response.read().decode("utf-8"))
-            if "c" in res and isinstance(res["c"], list):
-                close_prices = [float(x) for x in res["c"] if x is not None]
-    except Exception:
-        pass
-
-    if close_prices:
-        close_series = pd.Series(close_prices).dropna().reset_index(drop=True)
-        if len(close_series) > 0:
-            price_current = float(close_series.iloc[-1])
-            ma_val = float(close_series.iloc[-200:].mean()) if len(close_series) >= 200 else float(close_series.mean())
-            return round(price_current, 2), round(ma_val, 2)
-
-    return float(st.session_state.price_current), float(st.session_state.ma200)
-
-
-GEMINI_FIELDS = [
-    "pe_current", "pb_current", "rf", "dy_current",
-    "roe_current", "eps_growth_exp", "us10y", "us_cpi",
-    "price_current", "ma200", "volatility_current", "drawdown_pct",
-]
-
-
-def fetch_market_data_via_gemini(api_key: str) -> dict:
-    dnse_price, dnse_ma200 = fetch_vnindex_yfinance()
-    clean_key = api_key.strip()
-    encoded_key = urllib.parse.quote(clean_key)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={encoded_key}"
-
-    prompt = f"""
-    Cung cấp ước tính thông số thực tế mới nhất:
-    - VN-Index Price: {dnse_price}, MA200: {dnse_ma200}
-
-    Trả về JSON thuần túy:
-    {{
-        "pe_current": float, "pb_current": float, "rf": float, "dy_current": float,
-        "roe_current": float, "eps_growth_exp": float,
-        "us10y": float (Lợi suất TPCP Mỹ 10 năm - %),
-        "us_cpi": float (Lạm phát CPI Mỹ - %),
-        "price_current": {dnse_price}, "ma200": {dnse_ma200},
-        "volatility_current": float, "drawdown_pct": float
-    }}
-    """
-    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.1}}
-    data_bytes = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=25) as response:
-        res_data = json.loads(response.read().decode("utf-8"))
-        text_response = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        if "{" in text_response and "}" in text_response:
-            text_response = text_response[text_response.find("{"):text_response.rfind("}") + 1]
-        return json.loads(text_response)
-
-
 # ---------------------------------------------------------------------------
-# Sidebar - Nhập liệu & Quản lý File JSON Config
+# Sidebar - Nhập liệu & Auto-Fill
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Thông số đầu vào")
 
-with st.sidebar.expander("📁 Quản lý File Config (JSON)", expanded=True):
+with st.sidebar.expander("📁 Quản lý File Config (JSON)", expanded=False):
     config_data = {key: st.session_state[key] for key in DEFAULTS.keys() if key != "gemini_api_key"}
     json_string = json.dumps(config_data, indent=2, ensure_ascii=False)
     
@@ -204,35 +283,51 @@ with st.sidebar.expander("📁 Quản lý File Config (JSON)", expanded=True):
             for k, v in imported_data.items():
                 if k in DEFAULTS:
                     st.session_state[k] = v
-            st.success("✅ Tải dữ liệu từ File JSON thành công!")
+            st.success("✅ Import thành công!")
             st.rerun()
         except Exception as e:
             st.error(f"❌ File JSON không hợp lệ: {e}")
 
 st.sidebar.markdown("---")
 
-with st.sidebar.expander("📊 VNDirect Dstock Auto-Fill", expanded=False):
-    if st.button("🔄 Lấy P/E, P/B, DY từ VNDirect", use_container_width=True):
-        vnd_data = fetch_vndirect_market_data()
-        if vnd_data:
-            for k, v in vnd_data.items():
+# Nút lấy dữ liệu chứng khoán từ vnstock
+with st.sidebar.expander("🚀 vnstock (Chứng khoán & VN30)", expanded=True):
+    if st.button("🚀 Lấy dữ liệu từ vnstock", use_container_width=True):
+        progress_bar = st.sidebar.progress(0)
+        status_box = st.sidebar.status("Đang kết nối vnstock...", expanded=True)
+        
+        vn_data = fetch_vnstock_market_data(progress_bar, status_box)
+        if vn_data:
+            for k, v in vn_data.items():
                 st.session_state[k] = v
-            st.success("Đã cập nhật từ VNDirect!")
+            st.sidebar.success("✅ Đã cập nhật chỉ số VN30 & Kỹ thuật từ vnstock!")
             st.rerun()
 
-with st.sidebar.expander("🤖 Gemini AI Auto-Fill", expanded=False):
+# Nút Gemini AI - CHỈ LẤY THAM SỐ VĨ MÔ & DỰ BÁO CÒN THIẾU
+with st.sidebar.expander("🤖 Gemini AI (Tham số Vĩ mô thiếu)", expanded=True):
+    st.caption("🔍 Chức năng này chỉ lấy các tham số **vnstock KHÔNG có**: `Lãi suất phi rủi ro Rf (ERP)`, `US10Y`, `US CPI`, `EPS Growth Exp`, `Volatility Avg`.")
     st.session_state.gemini_api_key = st.text_input("Gemini API Key", value=st.session_state.gemini_api_key, type="password")
-    if st.button("Tự động lấy dữ liệu AI"):
-        if st.session_state.gemini_api_key:
+    
+    if st.button("🌐 Gemini Auto-Fill Tham số Vĩ mô", use_container_width=True):
+        if not st.session_state.gemini_api_key:
+            st.warning("⚠️ Vui lòng nhập Gemini API Key!")
+        else:
             try:
-                data = fetch_market_data_via_gemini(st.session_state.gemini_api_key)
-                for k in GEMINI_FIELDS:
-                    if k in data and data[k] is not None:
-                        st.session_state[k] = float(data[k])
-                st.success("Đã cập nhật dữ liệu AI!")
+                with st.spinner("🤖 Gemini đang truy xuất thông số vĩ mô..."):
+                    missing_data = fetch_missing_params_via_gemini(st.session_state.gemini_api_key)
+                    
+                    updated_count = 0
+                    for key in MISSING_PARAMS_KEYS:
+                        if key in missing_data and missing_data[key] is not None:
+                            st.session_state[key] = float(missing_data[key])
+                            updated_count += 1
+                            
+                st.sidebar.success(f"✅ Đã cập nhật thành công {updated_count} tham số vĩ mô từ Gemini AI!")
                 st.rerun()
             except Exception as e:
-                st.error(f"Lỗi AI: {e}")
+                st.sidebar.error(f"❌ Lỗi Gemini AI: {e}")
+
+st.sidebar.markdown("---")
 
 with st.sidebar.expander("👤 Thông tin nhà đầu tư", expanded=True):
     st.session_state.age = st.number_input("Tuổi của bạn", 18, 100, int(st.session_state.age))
@@ -247,14 +342,17 @@ with st.sidebar.expander("📈 Định giá & P/E, P/B, ERP, DY", expanded=False
     st.session_state.pb_current = st.number_input("PB hiện tại", 0.01, 50.0, float(st.session_state.pb_current), 0.05)
     st.session_state.pb_min = st.number_input("PB min", 0.01, 50.0, float(st.session_state.pb_min), 0.05)
     st.session_state.pb_max = st.number_input("PB max", 0.01, 50.0, float(st.session_state.pb_max), 0.05)
-    st.session_state.rf = st.number_input("Lợi suất TPCP VN - Rf (%)", 0.0, 30.0, float(st.session_state.rf), 0.1)
+    
+    # --- Đã cập nhật nhãn hiển thị tại đây ---
+    st.session_state.rf = st.number_input("Lãi suất phi rủi ro Rf (%) để tính ERP [Gemini]", 0.0, 30.0, float(st.session_state.rf), 0.1)
+    
     st.session_state.erp_min = st.number_input("ERP min (%)", -30.0, 30.0, float(st.session_state.erp_min), 0.1)
     st.session_state.erp_max = st.number_input("ERP max (%)", -30.0, 30.0, float(st.session_state.erp_max), 0.1)
     st.session_state.dy_current = st.number_input("DY hiện tại (%)", 0.0, 30.0, float(st.session_state.dy_current), 0.1)
     st.session_state.dy_min = st.number_input("DY min (%)", 0.0, 30.0, float(st.session_state.dy_min), 0.1)
     st.session_state.dy_max = st.number_input("DY max (%)", 0.0, 30.0, float(st.session_state.dy_max), 0.1)
 
-with st.sidebar.expander("🌐 Vĩ mô Mỹ & Vàng Động", expanded=True):
+with st.sidebar.expander("🌐 Vĩ mô Mỹ & Vàng Động [Gemini Auto]", expanded=True):
     st.session_state.us10y = st.number_input("Lợi suất TPCP Mỹ 10 năm - US10Y (%)", 0.0, 20.0, float(st.session_state.us10y), 0.05)
     st.session_state.us_cpi = st.number_input("Lạm phát CPI Mỹ (%)", -5.0, 30.0, float(st.session_state.us_cpi), 0.1)
     real_yield = st.session_state.us10y - st.session_state.us_cpi
@@ -263,14 +361,14 @@ with st.sidebar.expander("🌐 Vĩ mô Mỹ & Vàng Động", expanded=True):
 with st.sidebar.expander("🛡️ Chất lượng & Tăng trưởng", expanded=False):
     st.session_state.roe_current = st.number_input("ROE hiện tại (%)", -50.0, 100.0, float(st.session_state.roe_current), 0.5)
     st.session_state.roe_benchmark = st.number_input("ROE chuẩn (%)", 0.0, 100.0, float(st.session_state.roe_benchmark), 0.5)
-    st.session_state.eps_growth_exp = st.number_input("Tăng trưởng EPS dự phóng (%)", -100.0, 200.0, float(st.session_state.eps_growth_exp), 0.5)
+    st.session_state.eps_growth_exp = st.number_input("Tăng trưởng EPS dự phóng (%) [Gemini]", -100.0, 200.0, float(st.session_state.eps_growth_exp), 0.5)
     st.session_state.eps_growth_benchmark = st.number_input("Tăng trưởng EPS chuẩn (%)", -50.0, 100.0, float(st.session_state.eps_growth_benchmark), 0.5)
 
 with st.sidebar.expander("📉 Xu hướng Kỹ thuật", expanded=False):
     st.session_state.price_current = st.number_input("VN-Index Giá", 0.0, 1e7, float(st.session_state.price_current), 1.0)
     st.session_state.ma200 = st.number_input("VN-Index MA200", 0.0, 1e7, float(st.session_state.ma200), 1.0)
     st.session_state.volatility_current = st.number_input("Volatility thực tế (%)", 0.0, 200.0, float(st.session_state.volatility_current), 0.5)
-    st.session_state.volatility_avg = st.number_input("Volatility TB (%)", 0.0, 200.0, float(st.session_state.volatility_avg), 0.5)
+    st.session_state.volatility_avg = st.number_input("Volatility TB (%) [Gemini]", 0.0, 200.0, float(st.session_state.volatility_avg), 0.5)
     st.session_state.drawdown_pct = st.number_input("Drawdown (%)", 0.0, 100.0, float(st.session_state.drawdown_pct), 0.5)
 
 st.sidebar.markdown("---")
@@ -302,7 +400,6 @@ if calc_clicked:
     result = compute(inputs)
     st.session_state.last_result = result
 
-    # GHI LOG TƯƠNG THÍCH VỚI FILE GỐC (sử dụng make_log_row và append_log_row)
     if SHEETS_ON:
         try:
             row = make_log_row(inputs.age, result)
@@ -320,7 +417,7 @@ if calc_clicked:
             "gold_weight": result.gold_weight,
         }
         st.session_state.log.append(row_fallback)
-        st.toast("ℹ️ Đã lưu tạm thời vào phiên (Chưa bật Google Sheets).", icon="📝")
+        st.toast("ℹ️ Đã lưu tạm thời vào phiên.", icon="📝")
 
 result = st.session_state.get("last_result")
 
@@ -342,7 +439,6 @@ with col1:
                    f"**📌 {article}**\n\n"
                    f"**📌 {clause}**")
 
-        # NÚT XEM TOÀN VĂN HIẾN PHÁP
         if st.button("📜 Xem toàn văn Hiến pháp Đầu tư VAM", use_container_width=True):
             st.session_state.show_constitution = not st.session_state.show_constitution
 
@@ -352,15 +448,15 @@ with col1:
             
             **Chương I: Tôn chỉ & Nguyên tắc cốt lõi**
             - **Định giá là kim chỉ nam:** Phân bổ tài sản phải dựa trên mức độ rẻ/đắt của thị trường thông qua hệ thống định giá định lượng (P/E, P/B, ERP, DY).
-            - **Kỷ luật chiến lược:** Tuyệt đối tuân thủ các quy tắc tự động theo điểm số định giá (Valuation Score), không để cảm xúc chi phối quyết định đầu tư.
+            - **Kỷ luật chiến lược:** Tuyệt đối tuân thủ các quy tắc tự động theo điểm số định giá (Valuation Score).
             
             **Chương II: Quy tắc phân bổ tỷ trọng tài sản**
-            - **Cổ phiếu (Equity):** Tăng tỷ trọng khi thị trường ở vùng định giá thấp (vùng rẻ, Z-score cao) và hạ tỷ trọng khi thị trường hưng phấn, đắt đỏ.
-            - **Trái phiếu (Bond):** Đóng vai trò neo giữ sự ổn định, giảm thiểu biến động và đảm bảo dòng tiền cấu trúc cho danh mục.
-            - **Vàng động (Dynamic Gold):** Tài sản phòng thủ động, điều chỉnh theo rủi ro vĩ mô, lạm phát thực (Real Yield) và biến động thị trường.
+            - **Cổ phiếu (Equity):** Tăng tỷ trọng khi thị trường rẻ, hạ tỷ trọng khi thị trường đắt đỏ.
+            - **Trái phiếu (Bond):** Đóng vai trò neo giữ sự ổn định, giảm thiểu biến động.
+            - **Vàng động (Dynamic Gold):** Điều chỉnh theo rủi ro vĩ mô, lạm phát thực (Real Yield).
             
             **Chương III: Quản trị rủi ro & Vĩ mô**
-            - Giám sát chặt chẽ các thông số vĩ mô toàn cầu (US10Y, CPI Mỹ) và kỹ thuật nội tại (MA200, Drawdown, Volatility) để bảo vệ vốn toàn diện.
+            - Giám sát chặt chẽ các thông số vĩ mô (US10Y, CPI Mỹ) và kỹ thuật nội tại (MA200, Drawdown, Volatility).
             """)
 
         rec = getattr(result, "recommendation", {})
@@ -378,12 +474,6 @@ with col1:
         m2.metric("Trái phiếu", f"{result.bond_weight:.1f}%")
         m3.metric("Vàng (Dynamic)", f"{result.gold_weight:.1f}%")
 
-        st.markdown("---")
-        if SHEETS_ON:
-            st.caption("🟢 Chế độ ghi log tự động vào Google Sheets đang BẬT.")
-        else:
-            st.caption("ℹ️ Cấu hình Google Sheets (`gcp_service_account` và `sheets`) trong Secrets để lưu trữ vĩnh viễn trực tuyến.")
-
 with col2:
     st.subheader("📈 Biểu đồ phân bổ")
     if result is not None:
@@ -394,7 +484,7 @@ with col2:
         st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------------------------
-# TAB HIỂN THỊ CHI TIẾT & LỊCH SỬ LOGS GOOGLE SHEETS
+# TAB HIỂN THỊ CHI TIẾT & LỊCH SỬ LOGS
 # ---------------------------------------------------------------------------
 if result is not None:
     st.markdown("---")
@@ -407,17 +497,13 @@ if result is not None:
     with tab2:
         col_hdr1, col_hdr2 = st.columns([4, 1])
         with col_hdr1:
-            st.caption("✅ Nhật ký lưu trữ lịch sử các lần tính toán VAM trên Google Sheets." if SHEETS_ON else "⚠️ Chưa cấu hình Google Sheets - Hiển thị nhật ký phiên làm việc hiện tại.")
+            st.caption("✅ Nhật ký lưu trữ lịch sử các lần tính toán VAM trên Google Sheets." if SHEETS_ON else "⚠️ Chưa cấu hình Google Sheets.")
         with col_hdr2:
             if st.button("🔄 Làm mới"):
                 st.rerun()
 
         try:
-            if SHEETS_ON:
-                df_logs = load_log_df()
-            else:
-                df_logs = pd.DataFrame(st.session_state.log)
-
+            df_logs = load_log_df() if SHEETS_ON else pd.DataFrame(st.session_state.log)
             if not df_logs.empty:
                 st.dataframe(df_logs, use_container_width=True, hide_index=True)
                 st.download_button(
