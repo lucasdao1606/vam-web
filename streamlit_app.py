@@ -59,6 +59,27 @@ if "show_constitution" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
+# Callback xử lý Import JSON chuẩn xác
+# ---------------------------------------------------------------------------
+def handle_json_import():
+    uploaded = st.session_state.get("json_file_uploader")
+    if uploaded is not None:
+        try:
+            imported_data = json.load(uploaded)
+            for k, v in imported_data.items():
+                if k in DEFAULTS:
+                    if k == "age":
+                        st.session_state[k] = int(v)
+                    elif isinstance(v, (int, float)):
+                        st.session_state[k] = float(v)
+                    else:
+                        st.session_state[k] = v
+            st.toast("✅ Đã cập nhật tham số từ file JSON!", icon="📥")
+        except Exception as e:
+            st.error(f"❌ Lỗi đọc file JSON: {e}")
+
+
+# ---------------------------------------------------------------------------
 # 1. Hàm lấy dữ liệu vnstock (Chỉ lấy các chỉ số chứng khoán & VN30)
 # ---------------------------------------------------------------------------
 def fetch_vnstock_market_data(progress_bar, status_box) -> dict:
@@ -276,17 +297,13 @@ with st.sidebar.expander("📁 Quản lý File Config (JSON)", expanded=False):
         use_container_width=True
     )
     
-    uploaded_file = st.file_uploader("📂 Import Config từ JSON", type=["json"])
-    if uploaded_file is not None:
-        try:
-            imported_data = json.load(uploaded_file)
-            for k, v in imported_data.items():
-                if k in DEFAULTS:
-                    st.session_state[k] = v
-            st.success("✅ Import thành công!")
-            st.rerun()
-        except Exception as e:
-            st.error(f"❌ File JSON không hợp lệ: {e}")
+    # Sử dụng callback on_change để đảm bảo cập nhật đồng bộ 100% trước khi vẽ giao diện
+    st.file_uploader(
+        "📂 Import Config từ JSON",
+        type=["json"],
+        key="json_file_uploader",
+        on_change=handle_json_import
+    )
 
 st.sidebar.markdown("---")
 
@@ -306,7 +323,7 @@ with st.sidebar.expander("🚀 vnstock (Chứng khoán & VN30)", expanded=True):
 # Nút Gemini AI - CHỈ LẤY THAM SỐ VĨ MÔ & DỰ BÁO CÒN THIẾU
 with st.sidebar.expander("🤖 Gemini AI (Tham số Vĩ mô thiếu)", expanded=True):
     st.caption("🔍 Chức năng này chỉ lấy các tham số **vnstock KHÔNG có**: `Lãi suất phi rủi ro Rf (ERP)`, `US10Y`, `US CPI`, `EPS Growth Exp`, `Volatility Avg`.")
-    st.session_state.gemini_api_key = st.text_input("Gemini API Key", value=st.session_state.gemini_api_key, type="password")
+    st.text_input("Gemini API Key", key="gemini_api_key", type="password")
     
     if st.button("🌐 Gemini Auto-Fill Tham số Vĩ mô", use_container_width=True):
         if not st.session_state.gemini_api_key:
@@ -330,46 +347,44 @@ with st.sidebar.expander("🤖 Gemini AI (Tham số Vĩ mô thiếu)", expanded=
 st.sidebar.markdown("---")
 
 with st.sidebar.expander("👤 Thông tin nhà đầu tư", expanded=True):
-    st.session_state.age = st.number_input("Tuổi của bạn", 18, 100, int(st.session_state.age))
+    st.number_input("Tuổi của bạn", 18, 100, key="age")
     saa_equity = max(0.0, float(100 - st.session_state.age))
     saa_gold = 10.0
     saa_bond = max(0.0, 100.0 - saa_equity - saa_gold)
 
 with st.sidebar.expander("📈 Định giá & P/E, P/B, ERP, DY", expanded=False):
-    st.session_state.pe_current = st.number_input("PE hiện tại", 0.01, 200.0, float(st.session_state.pe_current), 0.1)
-    st.session_state.pe_min = st.number_input("PE min", 0.01, 200.0, float(st.session_state.pe_min), 0.1)
-    st.session_state.pe_max = st.number_input("PE max", 0.01, 200.0, float(st.session_state.pe_max), 0.1)
-    st.session_state.pb_current = st.number_input("PB hiện tại", 0.01, 50.0, float(st.session_state.pb_current), 0.05)
-    st.session_state.pb_min = st.number_input("PB min", 0.01, 50.0, float(st.session_state.pb_min), 0.05)
-    st.session_state.pb_max = st.number_input("PB max", 0.01, 50.0, float(st.session_state.pb_max), 0.05)
+    st.number_input("PE hiện tại", 0.01, 200.0, step=0.1, key="pe_current")
+    st.number_input("PE min", 0.01, 200.0, step=0.1, key="pe_min")
+    st.number_input("PE max", 0.01, 200.0, step=0.1, key="pe_max")
+    st.number_input("PB hiện tại", 0.01, 50.0, step=0.05, key="pb_current")
+    st.number_input("PB min", 0.01, 50.0, step=0.05, key="pb_min")
+    st.number_input("PB max", 0.01, 50.0, step=0.05, key="pb_max")
     
-    # --- Đã cập nhật nhãn hiển thị tại đây ---
-    st.session_state.rf = st.number_input("Lãi suất phi rủi ro Rf (%) để tính ERP [Gemini]", 0.0, 30.0, float(st.session_state.rf), 0.1)
-    
-    st.session_state.erp_min = st.number_input("ERP min (%)", -30.0, 30.0, float(st.session_state.erp_min), 0.1)
-    st.session_state.erp_max = st.number_input("ERP max (%)", -30.0, 30.0, float(st.session_state.erp_max), 0.1)
-    st.session_state.dy_current = st.number_input("DY hiện tại (%)", 0.0, 30.0, float(st.session_state.dy_current), 0.1)
-    st.session_state.dy_min = st.number_input("DY min (%)", 0.0, 30.0, float(st.session_state.dy_min), 0.1)
-    st.session_state.dy_max = st.number_input("DY max (%)", 0.0, 30.0, float(st.session_state.dy_max), 0.1)
+    st.number_input("Lãi suất phi rủi ro Rf (%) để tính ERP [Gemini]", 0.0, 30.0, step=0.1, key="rf")
+    st.number_input("ERP min (%)", -30.0, 30.0, step=0.1, key="erp_min")
+    st.number_input("ERP max (%)", -30.0, 30.0, step=0.1, key="erp_max")
+    st.number_input("DY hiện tại (%)", 0.0, 30.0, step=0.1, key="dy_current")
+    st.number_input("DY min (%)", 0.0, 30.0, step=0.1, key="dy_min")
+    st.number_input("DY max (%)", 0.0, 30.0, step=0.1, key="dy_max")
 
 with st.sidebar.expander("🌐 Vĩ mô Mỹ & Vàng Động [Gemini Auto]", expanded=True):
-    st.session_state.us10y = st.number_input("Lợi suất TPCP Mỹ 10 năm - US10Y (%)", 0.0, 20.0, float(st.session_state.us10y), 0.05)
-    st.session_state.us_cpi = st.number_input("Lạm phát CPI Mỹ (%)", -5.0, 30.0, float(st.session_state.us_cpi), 0.1)
+    st.number_input("Lợi suất TPCP Mỹ 10 năm - US10Y (%)", 0.0, 20.0, step=0.05, key="us10y")
+    st.number_input("Lạm phát CPI Mỹ (%)", -5.0, 30.0, step=0.1, key="us_cpi")
     real_yield = st.session_state.us10y - st.session_state.us_cpi
     st.caption(f"💡 Lợi suất thực Mỹ (Real Yield): **{real_yield:.2f}%**")
 
 with st.sidebar.expander("🛡️ Chất lượng & Tăng trưởng", expanded=False):
-    st.session_state.roe_current = st.number_input("ROE hiện tại (%)", -50.0, 100.0, float(st.session_state.roe_current), 0.5)
-    st.session_state.roe_benchmark = st.number_input("ROE chuẩn (%)", 0.0, 100.0, float(st.session_state.roe_benchmark), 0.5)
-    st.session_state.eps_growth_exp = st.number_input("Tăng trưởng EPS dự phóng (%) [Gemini]", -100.0, 200.0, float(st.session_state.eps_growth_exp), 0.5)
-    st.session_state.eps_growth_benchmark = st.number_input("Tăng trưởng EPS chuẩn (%)", -50.0, 100.0, float(st.session_state.eps_growth_benchmark), 0.5)
+    st.number_input("ROE hiện tại (%)", -50.0, 100.0, step=0.5, key="roe_current")
+    st.number_input("ROE chuẩn (%)", 0.0, 100.0, step=0.5, key="roe_benchmark")
+    st.number_input("Tăng trưởng EPS dự phóng (%) [Gemini]", -100.0, 200.0, step=0.5, key="eps_growth_exp")
+    st.number_input("Tăng trưởng EPS chuẩn (%)", -50.0, 100.0, step=0.5, key="eps_growth_benchmark")
 
 with st.sidebar.expander("📉 Xu hướng Kỹ thuật", expanded=False):
-    st.session_state.price_current = st.number_input("VN-Index Giá", 0.0, 1e7, float(st.session_state.price_current), 1.0)
-    st.session_state.ma200 = st.number_input("VN-Index MA200", 0.0, 1e7, float(st.session_state.ma200), 1.0)
-    st.session_state.volatility_current = st.number_input("Volatility thực tế (%)", 0.0, 200.0, float(st.session_state.volatility_current), 0.5)
-    st.session_state.volatility_avg = st.number_input("Volatility TB (%) [Gemini]", 0.0, 200.0, float(st.session_state.volatility_avg), 0.5)
-    st.session_state.drawdown_pct = st.number_input("Drawdown (%)", 0.0, 100.0, float(st.session_state.drawdown_pct), 0.5)
+    st.number_input("VN-Index Giá", 0.0, 1e7, step=1.0, key="price_current")
+    st.number_input("VN-Index MA200", 0.0, 1e7, step=1.0, key="ma200")
+    st.number_input("Volatility thực tế (%)", 0.0, 200.0, step=0.5, key="volatility_current")
+    st.number_input("Volatility TB (%) [Gemini]", 0.0, 200.0, step=0.5, key="volatility_avg")
+    st.number_input("Drawdown (%)", 0.0, 100.0, step=0.5, key="drawdown_pct")
 
 st.sidebar.markdown("---")
 calc_clicked = st.sidebar.button("🚀 Tính toán phân bổ", use_container_width=True, type="primary")
