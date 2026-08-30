@@ -4,3 +4,5 @@ matplotlib>=3.8
 gspread>=6.0
 google-auth>=2.30
 plotly>=5.0.0
+vnstock>=4.0.0
+google-genai
