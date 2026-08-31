@@ -212,3 +212,5 @@ def compute(inputs: VAMInputs, constitution_path: str = "investment_constitution
         withdrawal_rate=withdrawal_rate, # Trả về giá trị đã tính toán
         legal_basis=legal_basis, rule_text=rule_text, recommendation=recommendation, details=details
     )
+    
+    # update
