@@ -7,6 +7,7 @@ Chạy ứng dụng: streamlit run streamlit_app.py
 import json
 import re
 import time
+import os
 from datetime import datetime, date, timedelta
 
 import pandas as pd
@@ -103,7 +104,14 @@ def handle_gemini_json_import():
         except Exception as e:
             st.error(f"❌ Lỗi đọc file JSON API Key: {e}")
 
+def is_local_env():
+    """Kiểm tra xem ứng dụng có đang chạy trên máy tính cá nhân không."""
+    return os.name == 'nt' or os.path.exists('/home/user') # Windows hoặc môi trường có desktop
+
 def save_local_file(content_or_df, default_ext, file_types, initial_file):
+    """Hàm gọi GUI lưu file của OS (chỉ cố gắng chạy nếu là Local PC)."""
+    if not is_local_env():
+        return False, "Server Cloud không hỗ trợ chọn thư mục trực tiếp."
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -128,7 +136,7 @@ def save_local_file(content_or_df, default_ext, file_types, initial_file):
             return True, file_path
         return False, "Đã hủy lưu."
     except Exception as e:
-        return False, f"Chức năng này chỉ hỗ trợ chạy Local PC. Lỗi: {e}"
+        return False, f"Lỗi giao diện hệ thống: {e}"
 
 
 def fetch_vnstock_market_data(progress_bar, status_box) -> dict:
@@ -334,14 +342,23 @@ with st.sidebar.expander("📁 Quản lý File Config (JSON)", expanded=False):
     config_data = {key: st.session_state[key] for key in DEFAULTS.keys() if key != "gemini_api_key"}
     json_string = json.dumps(config_data, indent=2, ensure_ascii=False)
     
-    if st.button("💾 Xuất File Config (Tùy chọn thư mục)", use_container_width=True):
-        success, msg = save_local_file(
-            json_string, ".json", [("JSON files", "*.json")], "vam_input_config.json"
+    if is_local_env():
+        if st.button("💾 Xuất File Config (Tùy chọn thư mục)", use_container_width=True):
+            success, msg = save_local_file(
+                json_string, ".json", [("JSON files", "*.json")], "vam_input_config.json"
+            )
+            if success:
+                st.toast(f"✅ Đã lưu tại: {msg}", icon="💾")
+            elif "Đã hủy" not in msg:
+                st.error(msg)
+    else:
+        st.download_button(
+            label="💾 Tải về File Config (JSON)",
+            file_name="vam_input_config.json",
+            mime="application/json",
+            data=json_string,
+            use_container_width=True
         )
-        if success:
-            st.toast(f"✅ Đã lưu tại: {msg}", icon="💾")
-        elif "Đã hủy" not in msg:
-            st.error(msg)
     
     st.file_uploader(
         "📂 Import Config từ JSON",
@@ -625,9 +642,8 @@ if result is not None and inputs is not None:
         ry_eval = "Rủi Ro Cao" if us_real_yield > 2.0 else "Nới Lỏng"
         detail_data.append({"Chỉ số": "Lợi suất thực (Mỹ)", "Giá trị hiện tại": f"{us_real_yield:.2f}%", "Ngưỡng (Min-Max)": "< 2.00%", "Đánh giá": ry_eval, "Nhận xét chi tiết": f"Môi trường vĩ mô quốc tế đang {'rút thanh khoản, gây áp lực mạnh lên định giá cổ phiếu' if ry_eval=='Rủi Ro Cao' else 'cung cấp thanh khoản dồi dào, thuận lợi cho dòng tiền'}."})
 
-        # --- NÂNG CẤP BỘ LỌC KỸ THUẬT ĐA TẦNG (MA20 & MA200) ---
         price, ma200 = inputs.price_current, inputs.ma200
-        ma20 = st.session_state.get("ma20", ma200) # Đọc giá trị MA20 từ session state
+        ma20 = st.session_state.get("ma20", ma200)
         
         if price >= ma200 and ma20 >= ma200:
             tech_eval, tech_cmt = "Uptrend Mạnh", "Giá và dòng tiền ngắn hạn (MA20) đều nằm trên xu hướng dài hạn (MA200), tín hiệu rất an toàn."
@@ -660,14 +676,22 @@ if result is not None and inputs is not None:
             if not df_logs.empty:
                 st.dataframe(df_logs, use_container_width=True, hide_index=True)
                 
-                if st.button("⬇️ Xuất log CSV (Tùy chọn thư mục)"):
-                    success, msg = save_local_file(
-                        df_logs, ".csv", [("CSV files", "*.csv")], "vam_log_export.csv"
+                if is_local_env():
+                    if st.button("⬇️ Xuất log CSV (Tùy chọn thư mục)"):
+                        success, msg = save_local_file(
+                            df_logs, ".csv", [("CSV files", "*.csv")], "vam_log_export.csv"
+                        )
+                        if success:
+                            st.toast(f"✅ Đã lưu tại: {msg}", icon="💾")
+                        elif "Đã hủy" not in msg:
+                            st.error(msg)
+                else:
+                    st.download_button(
+                        "⬇️ Tải xuống log CSV",
+                        df_logs.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="vam_log_export.csv",
+                        mime="text/csv"
                     )
-                    if success:
-                        st.toast(f"✅ Đã lưu tại: {msg}", icon="💾")
-                    elif "Đã hủy" not in msg:
-                        st.error(msg)
             else:
                 st.info("Chưa có bản ghi lịch sử nào.")
         except Exception as exc:
