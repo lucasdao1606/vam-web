@@ -67,6 +67,7 @@ class VAMResult:
     equity_weight: float
     bond_weight: float
     gold_weight: float
+    withdrawal_rate: float  # Bổ sung biến tỉ lệ rút vốn
     
     legal_basis: Dict[str, str]
     rule_text: str
@@ -187,6 +188,11 @@ def compute(inputs: VAMInputs, constitution_path: str = "investment_constitution
     equity_weight = clamp(raw_equity_weight - (gold_diff * 0.5), 5.0, 90.0)
     bond_weight = clamp(100.0 - equity_weight - gold_weight, 0.0, 90.0)
     
+    # 5.5 Tỉ lệ rút vốn động (Dynamic Withdrawal Rate)
+    # valuation_score dương (rẻ) -> giảm tỷ lệ rút vốn để giữ lại tài sản.
+    # valuation_score âm (đắt) -> tăng tỷ lệ rút vốn để chốt lời.
+    withdrawal_rate = clamp(4.0 - (valuation_score * 0.5), 3.0, 5.0)
+    
     # 6. Tra cứu Hiến Pháp
     constitution = load_constitution(constitution_path)
     legal_basis, rule_text, recommendation = query_constitution(valuation_score, constitution)
@@ -203,5 +209,6 @@ def compute(inputs: VAMInputs, constitution_path: str = "investment_constitution
         valuation_score=valuation_score, pe_score=pe_score, pb_score=pb_score,
         erp_score=erp_score, dy_score=dy_score, quality_adj=quality_adj,
         equity_weight=equity_weight, bond_weight=bond_weight, gold_weight=gold_weight,
+        withdrawal_rate=withdrawal_rate, # Trả về giá trị đã tính toán
         legal_basis=legal_basis, rule_text=rule_text, recommendation=recommendation, details=details
     )

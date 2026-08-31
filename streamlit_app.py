@@ -26,6 +26,19 @@ st.set_page_config(
     layout="wide"
 )
 
+# CSS tùy chỉnh để làm font chữ linh hoạt (responsive) và chống cắt chữ
+st.markdown(
+    """
+    <style>
+    [data-testid="stMetricValue"] {
+        font-size: clamp(1.2rem, 2vw, 2rem) !important;
+        white-space: normal !important; 
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 SHEETS_ON = sheets_configured()
 
 # Giá trị mặc định chuẩn hóa ban đầu
@@ -44,6 +57,7 @@ DEFAULTS = {
     "us10y": 4.25, "us_cpi": 2.90,
     "method": "step",
     "gemini_api_key": "",
+    "investment_notes": "",
 }
 
 # Khởi tạo Session State
@@ -210,8 +224,8 @@ MISSING_PARAMS_KEYS = ["rf", "us10y", "us_cpi", "eps_growth_exp", "volatility_av
 
 def fetch_missing_params_via_gemini(api_key: str) -> dict:
     """
-    Sử dụng Gemini API (SDK google-genai) với mô hình gemini-3.6-flash
-    để truy xuất CHỈ CÁC THAM SỐ VĨ MÔ & DỰ BÁO mà vnstock không hỗ trợ.
+    Sử dụng Gemini API kết hợp Google Search Grounding
+    để lấy dữ liệu vĩ mô cập nhật theo thời gian thực.
     """
     try:
         from google import genai
@@ -223,32 +237,37 @@ def fetch_missing_params_via_gemini(api_key: str) -> dict:
     client = genai.Client(api_key=api_key.strip())
 
     prompt = """
-    Bạn là một chuyên gia dữ liệu tài chính. Hãy cập nhật các thông số vĩ mô và dự báo mới nhất tính đến hiện tại.
-    Chỉ trả về DUY NHẤT một chuỗi JSON thuần túy chứa các tham số dưới đây (tính bằng phần trăm %):
+    Bạn là chuyên gia dữ liệu tài chính. Hãy SỬ DỤNG GOOGLE SEARCH để tìm kiếm và cập nhật các thông số vĩ mô mới nhất tính đến hôm nay.
+    Chỉ trả về DUY NHẤT một chuỗi JSON thuần túy chứa các tham số dưới đây (tính bằng phần trăm %, định dạng số thập phân, KHÔNG để trống):
 
     {
-        "rf": float (Lợi suất Trái phiếu Chính phủ Việt Nam kỳ hạn 10 năm - VN10Y, dùng làm lãi suất phi rủi ro Rf để tính ERP, ví dụ: 2.75),
-        "us10y": float (Lợi suất Trái phiếu Chính phủ Mỹ kỳ hạn 10 năm - US10Y, ví dụ: 4.25),
-        "us_cpi": float (Mức lạm phát CPI Mỹ tính theo năm mới nhất, ví dụ: 2.9),
-        "eps_growth_exp": float (Dự phóng mức tăng trưởng EPS bình quân rổ VN30/VN-Index trong 12 tháng tới %, ví dụ: 10.5),
-        "volatility_avg": float (Mức độ biến động Volatility trung bình dài hạn của VN-Index %, ví dụ: 17.5)
+        "rf": float (Lợi suất Trái phiếu Chính phủ Việt Nam kỳ hạn 10 năm - VN10Y hiện tại),
+        "us10y": float (Lợi suất Trái phiếu Chính phủ Mỹ kỳ hạn 10 năm - US10Y hiện tại),
+        "us_cpi": float (Mức lạm phát CPI Mỹ YoY mới nhất được công bố),
+        "eps_growth_exp": float (Dự phóng mức tăng trưởng EPS bình quân rổ VN30/VN-Index trong 12 tháng tới),
+        "volatility_avg": float (Mức độ biến động Volatility trung bình dài hạn của VN-Index)
     }
     """
 
-    response = client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.1,
-        ),
-    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-1.5-pro", 
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1,
+                tools=[{"google_search": {}}]
+            ),
+        )
 
-    text_response = response.text.strip()
-    if "{" in text_response and "}" in text_response:
-        text_response = text_response[text_response.find("{"):text_response.rfind("}") + 1]
+        text_response = response.text.strip()
+        if "{" in text_response and "}" in text_response:
+            text_response = text_response[text_response.find("{"):text_response.rfind("}") + 1]
 
-    return json.loads(text_response)
+        return json.loads(text_response)
+    except Exception as e:
+        st.error(f"Lỗi truy xuất Gemini: {e}")
+        return {}
 
 
 def draw_plotly_pie_chart(weights, labels, colors):
@@ -297,7 +316,6 @@ with st.sidebar.expander("📁 Quản lý File Config (JSON)", expanded=False):
         use_container_width=True
     )
     
-    # Sử dụng callback on_change để đảm bảo cập nhật đồng bộ 100% trước khi vẽ giao diện
     st.file_uploader(
         "📂 Import Config từ JSON",
         type=["json"],
@@ -320,7 +338,7 @@ with st.sidebar.expander("🚀 vnstock (Chứng khoán & VN30)", expanded=True):
             st.sidebar.success("✅ Đã cập nhật chỉ số VN30 & Kỹ thuật từ vnstock!")
             st.rerun()
 
-# Nút Gemini AI - CHỈ LẤY THAM SỐ VĨ MÔ & DỰ BÁO CÒN THIẾU
+# Nút Gemini AI
 with st.sidebar.expander("🤖 Gemini AI (Tham số Vĩ mô thiếu)", expanded=True):
     st.caption("🔍 Chức năng này chỉ lấy các tham số **vnstock KHÔNG có**: `Lãi suất phi rủi ro Rf (ERP)`, `US10Y`, `US CPI`, `EPS Growth Exp`, `Volatility Avg`.")
     st.text_input("Gemini API Key", key="gemini_api_key", type="password")
@@ -386,7 +404,10 @@ with st.sidebar.expander("📉 Xu hướng Kỹ thuật", expanded=False):
     st.number_input("Volatility TB (%) [Gemini]", 0.0, 200.0, step=0.5, key="volatility_avg")
     st.number_input("Drawdown (%)", 0.0, 100.0, step=0.5, key="drawdown_pct")
 
+# Thêm ô nhập liệu ghi chú
 st.sidebar.markdown("---")
+st.session_state.investment_notes = st.sidebar.text_area("📝 Ghi chú đầu tư", value=st.session_state.get("investment_notes", ""))
+
 calc_clicked = st.sidebar.button("🚀 Tính toán phân bổ", use_container_width=True, type="primary")
 
 # ---------------------------------------------------------------------------
@@ -414,27 +435,38 @@ if calc_clicked:
     )
     result = compute(inputs)
     st.session_state.last_result = result
+    st.session_state.last_inputs = inputs
+
+    row_fallback = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "note": st.session_state.investment_notes,
+        "age": inputs.age,
+        "pe_current": inputs.pe_current,
+        "pb_current": inputs.pb_current,
+        "rf": inputs.rf,
+        "us10y": inputs.us10y,
+        "us_cpi": inputs.us_cpi,
+        "eps_growth_exp": inputs.eps_growth_exp,
+        "valuation_score": result.valuation_score,
+        "equity_weight": result.equity_weight,
+        "bond_weight": result.bond_weight,
+        "gold_weight": result.gold_weight,
+        "withdrawal_rate": result.withdrawal_rate,
+    }
 
     if SHEETS_ON:
         try:
-            row = make_log_row(inputs.age, result)
+            row = make_log_row(inputs, result, st.session_state.investment_notes) 
             append_log_row(row)
             st.toast("✅ Đã tự động lưu kết quả lên Google Sheets!", icon="💾")
         except Exception as exc:
             st.warning(f"⚠️ Chưa ghi được log Google Sheets: {exc}")
     else:
-        row_fallback = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "age": inputs.age,
-            "valuation_score": result.valuation_score,
-            "equity_weight": result.equity_weight,
-            "bond_weight": result.bond_weight,
-            "gold_weight": result.gold_weight,
-        }
         st.session_state.log.append(row_fallback)
         st.toast("ℹ️ Đã lưu tạm thời vào phiên.", icon="📝")
 
 result = st.session_state.get("last_result")
+inputs = st.session_state.get("last_inputs")
 
 col1, col2 = st.columns([1.2, 1])
 
@@ -450,9 +482,7 @@ with col1:
         article = legal.get("article", "Quy tắc phân bổ tài sản")
         clause = legal.get("clause", "Căn cứ Định giá & Vĩ mô")
 
-        st.success(f"**📌 {chapter}**\n\n"
-                   f"**📌 {article}**\n\n"
-                   f"**📌 {clause}**")
+        st.success(f"**📌 {chapter}**\n\n**📌 {article}**\n\n**📌 {clause}**")
 
         if st.button("📜 Xem toàn văn Hiến pháp Đầu tư VAM", use_container_width=True):
             st.session_state.show_constitution = not st.session_state.show_constitution
@@ -460,18 +490,17 @@ with col1:
         if st.session_state.show_constitution:
             st.info("""
             ### 📜 HIẾN PHÁP ĐẦU TƯ VAM (TOÀN VĂN)
-            
             **Chương I: Tôn chỉ & Nguyên tắc cốt lõi**
-            - **Định giá là kim chỉ nam:** Phân bổ tài sản phải dựa trên mức độ rẻ/đắt của thị trường thông qua hệ thống định giá định lượng (P/E, P/B, ERP, DY).
-            - **Kỷ luật chiến lược:** Tuyệt đối tuân thủ các quy tắc tự động theo điểm số định giá (Valuation Score).
+            - **Định giá là kim chỉ nam:** Phân bổ tài sản phải dựa trên mức độ rẻ/đắt của thị trường.
+            - **Kỷ luật chiến lược:** Tuyệt đối tuân thủ quy tắc tự động theo điểm số (Valuation Score).
             
-            **Chương II: Quy tắc phân bổ tỷ trọng tài sản**
-            - **Cổ phiếu (Equity):** Tăng tỷ trọng khi thị trường rẻ, hạ tỷ trọng khi thị trường đắt đỏ.
-            - **Trái phiếu (Bond):** Đóng vai trò neo giữ sự ổn định, giảm thiểu biến động.
-            - **Vàng động (Dynamic Gold):** Điều chỉnh theo rủi ro vĩ mô, lạm phát thực (Real Yield).
+            **Chương II: Quy tắc phân bổ tỷ trọng**
+            - **Cổ phiếu:** Tăng tỷ trọng khi thị trường rẻ, hạ tỷ trọng khi đắt đỏ.
+            - **Trái phiếu:** Đóng vai trò neo giữ sự ổn định, giảm thiểu biến động.
+            - **Vàng động:** Điều chỉnh theo rủi ro vĩ mô, lạm phát thực (Real Yield).
             
-            **Chương III: Quản trị rủi ro & Vĩ mô**
-            - Giám sát chặt chẽ các thông số vĩ mô (US10Y, CPI Mỹ) và kỹ thuật nội tại (MA200, Drawdown, Volatility).
+            **Chương III: Quản trị rủi ro**
+            - Giám sát các thông số vĩ mô (US10Y, CPI Mỹ) và kỹ thuật nội tại (MA200, Drawdown).
             """)
 
         rec = getattr(result, "recommendation", {})
@@ -480,14 +509,13 @@ with col1:
         detail = rec.get("detail", "")
         rule_text = getattr(result, "rule_text", "")
 
-        st.info(f"**⚖️ Quy tắc:** {rule_text}\n\n"
-                f"**📢 Hành động:** `{action}` - **{headline}**\n\n"
-                f"**📝 Chi tiết:** {detail}")
+        st.info(f"**⚖️ Quy tắc:** {rule_text}\n\n**📢 Hành động:** `{action}` - **{headline}**\n\n**📝 Chi tiết:** {detail}")
 
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns([1, 1, 1.2, 1.2])
         m1.metric("Cổ phiếu", f"{result.equity_weight:.1f}%")
         m2.metric("Trái phiếu", f"{result.bond_weight:.1f}%")
         m3.metric("Vàng (Dynamic)", f"{result.gold_weight:.1f}%")
+        m4.metric("Rút vốn/năm", f"{result.withdrawal_rate:.1f}%")
 
 with col2:
     st.subheader("📈 Biểu đồ phân bổ")
@@ -501,13 +529,85 @@ with col2:
 # ---------------------------------------------------------------------------
 # TAB HIỂN THỊ CHI TIẾT & LỊCH SỬ LOGS
 # ---------------------------------------------------------------------------
-if result is not None:
+if result is not None and inputs is not None:
     st.markdown("---")
     tab1, tab2 = st.tabs(["🔍 Đánh giá Chi tiết Chỉ số", "📜 Lịch sử lưu Google Sheets"])
     
     with tab1:
-        if hasattr(result, "details"):
-            st.dataframe(pd.DataFrame(result.details), use_container_width=True, hide_index=True)
+        st.markdown("**Bảng Phân Tích Chuyên Sâu Từng Yếu Tố Của Danh Mục**")
+        detail_data = []
+        
+        # Đánh giá P/E
+        pe = inputs.pe_current
+        pe_min, pe_max = inputs.pe_min, inputs.pe_max
+        if pe <= pe_min:
+            pe_eval, pe_cmt = "Rất Rẻ", "Định giá theo lợi nhuận đang ở vùng rất hấp dẫn, ưu tiên tích lũy."
+        elif pe >= pe_max:
+            pe_eval, pe_cmt = "Rất Đắt", "Thị trường trả giá quá cao so với lợi nhuận tạo ra, rủi ro điều chỉnh lớn."
+        else:
+            pe_eval, pe_cmt = "Hợp Lý", "Định giá P/E nằm trong vùng trung tính, cân bằng giữa rủi ro và lợi nhuận."
+        detail_data.append({"Chỉ số": "P/E", "Giá trị hiện tại": f"{pe:.2f}", "Ngưỡng (Min-Max)": f"{pe_min} - {pe_max}", "Đánh giá": pe_eval, "Nhận xét chi tiết": pe_cmt})
+
+        # Đánh giá P/B
+        pb = inputs.pb_current
+        pb_min, pb_max = inputs.pb_min, inputs.pb_max
+        if pb <= pb_min:
+            pb_eval, pb_cmt = "Rất Rẻ", "Giá thị trường đang giao dịch gần với giá trị sổ sách ròng, cơ hội mua tốt."
+        elif pb >= pb_max:
+            pb_eval, pb_cmt = "Rất Đắt", "Định giá P/B ở mức cao, báo hiệu sự hưng phấn quá mức."
+        else:
+            pb_eval, pb_cmt = "Hợp Lý", "Định giá P/B ở vùng an toàn và phù hợp với lịch sử."
+        detail_data.append({"Chỉ số": "P/B", "Giá trị hiện tại": f"{pb:.2f}", "Ngưỡng (Min-Max)": f"{pb_min} - {pb_max}", "Đánh giá": pb_eval, "Nhận xét chi tiết": pb_cmt})
+
+        # Đánh giá ERP
+        erp_est = (1 / pe) * 100 - inputs.rf if pe > 0 else 0
+        erp_min, erp_max = inputs.erp_min, inputs.erp_max
+        if erp_est >= erp_max:
+            erp_eval, erp_cmt = "Rất Hấp Dẫn", "Phần bù rủi ro cao, lợi suất cổ phiếu vượt trội so với gửi tiết kiệm không rủi ro."
+        elif erp_est <= erp_min:
+            erp_eval, erp_cmt = "Kém Hấp Dẫn", "Lợi suất cổ phiếu quá mỏng, không đủ bù đắp rủi ro so với trái phiếu/tiết kiệm."
+        else:
+            erp_eval, erp_cmt = "Trung Tính", "Phần bù rủi ro ở mức chấp nhận được cho việc nắm giữ dài hạn."
+        detail_data.append({"Chỉ số": "ERP (Phần bù Rủi ro)", "Giá trị hiện tại": f"{erp_est:.2f}%", "Ngưỡng (Min-Max)": f"{erp_min}% - {erp_max}%", "Đánh giá": erp_eval, "Nhận xét chi tiết": erp_cmt})
+
+        # Đánh giá DY
+        dy = inputs.dy_current
+        dy_min, dy_max = inputs.dy_min, inputs.dy_max
+        if dy >= dy_max:
+            dy_eval, dy_cmt = "Tích Cực", "Dòng tiền từ cổ tức rất dồi dào, đóng vai trò phòng thủ xuất sắc khi TT biến động."
+        elif dy <= dy_min:
+            dy_eval, dy_cmt = "Tiêu Cực", "Tỷ suất cổ tức quá thấp, danh mục thiếu bộ đệm an toàn từ tiền mặt."
+        else:
+            dy_eval, dy_cmt = "Trung Bình", "Mức chi trả cổ tức duy trì ổn định, cung cấp dòng tiền vừa đủ."
+        detail_data.append({"Chỉ số": "Tỷ suất Cổ tức (DY)", "Giá trị hiện tại": f"{dy:.2f}%", "Ngưỡng (Min-Max)": f"{dy_min}% - {dy_max}%", "Đánh giá": dy_eval, "Nhận xét chi tiết": dy_cmt})
+
+        # Chất lượng ROE
+        roe, roe_bench = inputs.roe_current, inputs.roe_benchmark
+        roe_eval = "Tốt" if roe >= roe_bench else "Kém"
+        detail_data.append({"Chỉ số": "Chất lượng (ROE)", "Giá trị hiện tại": f"{roe:.2f}%", "Ngưỡng (Min-Max)": f">= {roe_bench}%", "Đánh giá": roe_eval, "Nhận xét chi tiết": f"Hiệu quả sử dụng vốn chủ sở hữu {'đạt yêu cầu tích cực' if roe_eval=='Tốt' else 'chưa đạt kỳ vọng tối thiểu'}."})
+
+        # Tăng trưởng EPS
+        eps, eps_bench = inputs.eps_growth_exp, inputs.eps_growth_benchmark
+        eps_eval = "Tích Cực" if eps >= eps_bench else "Tiêu Cực"
+        detail_data.append({"Chỉ số": "Tăng trưởng EPS", "Giá trị hiện tại": f"{eps:.2f}%", "Ngưỡng (Min-Max)": f">= {eps_bench}%", "Đánh giá": eps_eval, "Nhận xét chi tiết": f"Triển vọng tăng trưởng lợi nhuận {'đang mở rộng, hỗ trợ tăng giá' if eps_eval=='Tích Cực' else 'đang thu hẹp, tạo áp lực giảm giá'}."})
+
+        # Vĩ mô Mỹ (Lợi suất thực)
+        us_real_yield = inputs.us10y - inputs.us_cpi
+        ry_eval = "Rủi Ro Cao" if us_real_yield > 2.0 else "Nới Lỏng"
+        detail_data.append({"Chỉ số": "Lợi suất thực (Mỹ)", "Giá trị hiện tại": f"{us_real_yield:.2f}%", "Ngưỡng (Min-Max)": "< 2.00%", "Đánh giá": ry_eval, "Nhận xét chi tiết": f"Môi trường vĩ mô quốc tế đang {'rút thanh khoản, gây áp lực mạnh lên định giá cổ phiếu' if ry_eval=='Rủi Ro Cao' else 'cung cấp thanh khoản dồi dào, thuận lợi cho dòng tiền'}."})
+
+        # Kỹ thuật MA200
+        price, ma200 = inputs.price_current, inputs.ma200
+        trend = "Uptrend" if price >= ma200 else "Downtrend"
+        detail_data.append({"Chỉ số": "Xu hướng (vs MA200)", "Giá trị hiện tại": f"{price:.1f}", "Ngưỡng (Min-Max)": f"MA200: {ma200}", "Đánh giá": trend, "Nhận xét chi tiết": f"Thị trường đang nằm {'trên' if trend=='Uptrend' else 'dưới'} đường trung bình dài hạn, củng cố đà {'tăng' if trend=='Uptrend' else 'giảm'}."})
+
+        # Kỹ thuật Volatility
+        vol, vol_avg = inputs.volatility_current, inputs.volatility_avg
+        vol_eval = "Rủi Ro Cao" if vol > vol_avg else "Ổn Định"
+        detail_data.append({"Chỉ số": "Biến động (Volatility)", "Giá trị hiện tại": f"{vol:.2f}%", "Ngưỡng (Min-Max)": f"Avg: {vol_avg}%", "Đánh giá": vol_eval, "Nhận xét chi tiết": f"Trạng thái tâm lý thị trường đang {'dao động rất mạnh, tiềm ẩn rủi ro bẫy giá' if vol_eval=='Rủi Ro Cao' else 'ổn định, thuận lợi cho việc giữ vị thế'}."})
+        
+        df_eval = pd.DataFrame(detail_data)
+        st.dataframe(df_eval, use_container_width=True, hide_index=True)
             
     with tab2:
         col_hdr1, col_hdr2 = st.columns([4, 1])
@@ -523,7 +623,7 @@ if result is not None:
                 st.dataframe(df_logs, use_container_width=True, hide_index=True)
                 st.download_button(
                     "⬇️ Xuất log CSV",
-                    df_logs.to_csv(index=False).encode("utf-8"),
+                    df_logs.to_csv(index=False).encode("utf-8-sig"),
                     file_name="vam_log_export.csv",
                     mime="text/csv"
                 )
