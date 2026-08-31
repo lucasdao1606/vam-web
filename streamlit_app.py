@@ -26,7 +26,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# CSS tùy chỉnh để làm font chữ linh hoạt (responsive) và chống cắt chữ
 st.markdown(
     """
     <style>
@@ -41,7 +40,6 @@ st.markdown(
 
 SHEETS_ON = sheets_configured()
 
-# Giá trị mặc định chuẩn hóa ban đầu
 DEFAULTS = {
     "age": 40,
     "pe_current": 14.2, "pe_min": 10.0, "pe_max": 20.0,
@@ -51,7 +49,7 @@ DEFAULTS = {
     "w_pe": 30.0, "w_pb": 20.0, "w_erp": 35.0, "w_dy": 15.0,
     "roe_current": 13.5, "roe_benchmark": 12.0,
     "eps_growth_exp": 10.0, "eps_growth_benchmark": 8.0,
-    "price_current": 1250.5, "ma200": 1265.2,
+    "price_current": 1250.5, "ma20": 1255.0, "ma200": 1265.2,
     "volatility_current": 16.2, "volatility_avg": 17.5,
     "drawdown_pct": 4.2,
     "us10y": 4.25, "us_cpi": 2.90,
@@ -60,7 +58,6 @@ DEFAULTS = {
     "investment_notes": "",
 }
 
-# Khởi tạo Session State
 for key, val in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
@@ -73,7 +70,7 @@ if "show_constitution" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Callback xử lý Import JSON chuẩn xác
+# Các hàm phụ trợ cục bộ
 # ---------------------------------------------------------------------------
 def handle_json_import():
     uploaded = st.session_state.get("json_file_uploader")
@@ -92,10 +89,48 @@ def handle_json_import():
         except Exception as e:
             st.error(f"❌ Lỗi đọc file JSON: {e}")
 
+def handle_gemini_json_import():
+    uploaded = st.session_state.get("gemini_json_uploader")
+    if uploaded is not None:
+        try:
+            data = json.load(uploaded)
+            api_key = data.get("api_key") or data.get("GEMINI_API_KEY") or data.get("key") or next(iter(data.values()), "")
+            if api_key and isinstance(api_key, str):
+                st.session_state["gemini_api_key"] = api_key.strip()
+                st.toast("✅ Đã tải Gemini API Key từ file JSON thành công!", icon="🔑")
+            else:
+                st.error("❌ Không tìm thấy định dạng API Key hợp lệ trong file JSON!")
+        except Exception as e:
+            st.error(f"❌ Lỗi đọc file JSON API Key: {e}")
 
-# ---------------------------------------------------------------------------
-# 1. Hàm lấy dữ liệu vnstock (Chỉ lấy các chỉ số chứng khoán & VN30)
-# ---------------------------------------------------------------------------
+def save_local_file(content_or_df, default_ext, file_types, initial_file):
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        
+        root = tk.Tk()
+        root.attributes("-topmost", True)
+        root.withdraw()
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=default_ext,
+            filetypes=file_types,
+            initialfile=initial_file
+        )
+        root.destroy()
+        
+        if file_path:
+            if isinstance(content_or_df, pd.DataFrame):
+                content_or_df.to_csv(file_path, index=False, encoding="utf-8-sig")
+            else:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(content_or_df)
+            return True, file_path
+        return False, "Đã hủy lưu."
+    except Exception as e:
+        return False, f"Chức năng này chỉ hỗ trợ chạy Local PC. Lỗi: {e}"
+
+
 def fetch_vnstock_market_data(progress_bar, status_box) -> dict:
     try:
         from vnstock import Reference, Fundamental, Quote
@@ -105,7 +140,6 @@ def fetch_vnstock_market_data(progress_bar, status_box) -> dict:
 
     results = {}
     
-    # Kỹ thuật VN-Index
     status_box.update(label="📈 Đang tải & chuẩn hóa chuỗi giá VN-Index...", state="running")
     progress_bar.progress(5)
     try:
@@ -123,6 +157,7 @@ def fetch_vnstock_market_data(progress_bar, status_box) -> dict:
                 close_prices = close_prices * 1000
                 
             p_curr = float(close_prices.iloc[-1])
+            ma20_val = float(close_prices.iloc[-20:].mean()) if len(close_prices) >= 20 else float(close_prices.mean())
             ma200_val = float(close_prices.iloc[-200:].mean()) if len(close_prices) >= 200 else float(close_prices.mean())
             
             returns = close_prices.pct_change().dropna()
@@ -133,13 +168,13 @@ def fetch_vnstock_market_data(progress_bar, status_box) -> dict:
             drawdown_val = float(abs(dd.min()) * 100)
 
             results["price_current"] = round(p_curr, 1)
+            results["ma20"] = round(ma20_val, 1)
             results["ma200"] = round(ma200_val, 1)
             results["volatility_current"] = round(vol_curr, 1)
             results["drawdown_pct"] = round(drawdown_val, 1)
     except Exception as e:
         st.warning(f"Không thể tính chỉ số kỹ thuật VNINDEX từ vnstock: {e}")
 
-    # Tài chính rổ VN30
     status_box.update(label="📋 Đang lấy danh sách mã rổ VN30...", state="running")
     progress_bar.progress(10)
     try:
@@ -216,17 +251,9 @@ def fetch_vnstock_market_data(progress_bar, status_box) -> dict:
     status_box.update(label="✅ Hoàn tất lấy dữ liệu từ vnstock!", state="complete", expanded=False)
     return results
 
-
-# ---------------------------------------------------------------------------
-# 2. Hàm Gemini AI - LẤY THAM SỐ VĨ MÔ/DỰ BÁO CÒN THIẾU
-# ---------------------------------------------------------------------------
 MISSING_PARAMS_KEYS = ["rf", "us10y", "us_cpi", "eps_growth_exp", "volatility_avg"]
 
 def fetch_missing_params_via_gemini(api_key: str) -> dict:
-    """
-    Sử dụng Gemini API kết hợp Google Search Grounding
-    để lấy dữ liệu vĩ mô cập nhật theo thời gian thực.
-    """
     try:
         from google import genai
         from google.genai import types
@@ -269,7 +296,6 @@ def fetch_missing_params_via_gemini(api_key: str) -> dict:
         st.error(f"Lỗi truy xuất Gemini: {e}")
         return {}
 
-
 def draw_plotly_pie_chart(weights, labels, colors):
     fig = go.Figure(
         data=[
@@ -308,13 +334,14 @@ with st.sidebar.expander("📁 Quản lý File Config (JSON)", expanded=False):
     config_data = {key: st.session_state[key] for key in DEFAULTS.keys() if key != "gemini_api_key"}
     json_string = json.dumps(config_data, indent=2, ensure_ascii=False)
     
-    st.download_button(
-        label="💾 Tải về File Config (JSON)",
-        file_name="vam_input_config.json",
-        mime="application/json",
-        data=json_string,
-        use_container_width=True
-    )
+    if st.button("💾 Xuất File Config (Tùy chọn thư mục)", use_container_width=True):
+        success, msg = save_local_file(
+            json_string, ".json", [("JSON files", "*.json")], "vam_input_config.json"
+        )
+        if success:
+            st.toast(f"✅ Đã lưu tại: {msg}", icon="💾")
+        elif "Đã hủy" not in msg:
+            st.error(msg)
     
     st.file_uploader(
         "📂 Import Config từ JSON",
@@ -325,7 +352,6 @@ with st.sidebar.expander("📁 Quản lý File Config (JSON)", expanded=False):
 
 st.sidebar.markdown("---")
 
-# Nút lấy dữ liệu chứng khoán từ vnstock
 with st.sidebar.expander("🚀 vnstock (Chứng khoán & VN30)", expanded=True):
     if st.button("🚀 Lấy dữ liệu từ vnstock", use_container_width=True):
         progress_bar = st.sidebar.progress(0)
@@ -338,14 +364,24 @@ with st.sidebar.expander("🚀 vnstock (Chứng khoán & VN30)", expanded=True):
             st.sidebar.success("✅ Đã cập nhật chỉ số VN30 & Kỹ thuật từ vnstock!")
             st.rerun()
 
-# Nút Gemini AI
 with st.sidebar.expander("🤖 Gemini AI (Tham số Vĩ mô thiếu)", expanded=True):
-    st.caption("🔍 Chức năng này chỉ lấy các tham số **vnstock KHÔNG có**: `Lãi suất phi rủi ro Rf (ERP)`, `US10Y`, `US CPI`, `EPS Growth Exp`, `Volatility Avg`.")
-    st.text_input("Gemini API Key", key="gemini_api_key", type="password")
+    st.caption("🔍 Chức năng này lấy các tham số vĩ mô: `Rf`, `US10Y`, `US CPI`, `EPS Growth Exp`, `Volatility Avg`.")
+    
+    st.file_uploader(
+        "📂 Import file JSON chứa Gemini API Key",
+        type=["json"],
+        key="gemini_json_uploader",
+        on_change=handle_gemini_json_import
+    )
+    
+    if st.session_state.get("gemini_api_key"):
+        st.success("🔑 Đã nạp Gemini API Key thành công trong phiên làm việc.")
+    else:
+        st.info("ℹ️ Vui lòng import file JSON chứa API Key để kích hoạt.")
     
     if st.button("🌐 Gemini Auto-Fill Tham số Vĩ mô", use_container_width=True):
-        if not st.session_state.gemini_api_key:
-            st.warning("⚠️ Vui lòng nhập Gemini API Key!")
+        if not st.session_state.get("gemini_api_key"):
+            st.warning("⚠️ Vui lòng import file JSON chứa Gemini API Key trước!")
         else:
             try:
                 with st.spinner("🤖 Gemini đang truy xuất thông số vĩ mô..."):
@@ -397,14 +433,14 @@ with st.sidebar.expander("🛡️ Chất lượng & Tăng trưởng", expanded=F
     st.number_input("Tăng trưởng EPS dự phóng (%) [Gemini]", -100.0, 200.0, step=0.5, key="eps_growth_exp")
     st.number_input("Tăng trưởng EPS chuẩn (%)", -50.0, 100.0, step=0.5, key="eps_growth_benchmark")
 
-with st.sidebar.expander("📉 Xu hướng Kỹ thuật", expanded=False):
+with st.sidebar.expander("📉 Xu hướng Kỹ thuật (Đa tầng MA20 & MA200)", expanded=False):
     st.number_input("VN-Index Giá", 0.0, 1e7, step=1.0, key="price_current")
-    st.number_input("VN-Index MA200", 0.0, 1e7, step=1.0, key="ma200")
+    st.number_input("VN-Index MA20 (Dòng tiền ngắn/trung hạn)", 0.0, 1e7, step=1.0, key="ma20")
+    st.number_input("VN-Index MA200 (Xu hướng lớn)", 0.0, 1e7, step=1.0, key="ma200")
     st.number_input("Volatility thực tế (%)", 0.0, 200.0, step=0.5, key="volatility_current")
     st.number_input("Volatility TB (%) [Gemini]", 0.0, 200.0, step=0.5, key="volatility_avg")
     st.number_input("Drawdown (%)", 0.0, 100.0, step=0.5, key="drawdown_pct")
 
-# Thêm ô nhập liệu ghi chú
 st.sidebar.markdown("---")
 st.session_state.investment_notes = st.sidebar.text_area("📝 Ghi chú đầu tư", value=st.session_state.get("investment_notes", ""))
 
@@ -500,7 +536,7 @@ with col1:
             - **Vàng động:** Điều chỉnh theo rủi ro vĩ mô, lạm phát thực (Real Yield).
             
             **Chương III: Quản trị rủi ro**
-            - Giám sát các thông số vĩ mô (US10Y, CPI Mỹ) và kỹ thuật nội tại (MA200, Drawdown).
+            - Giám sát các thông số vĩ mô (US10Y, CPI Mỹ) và hệ thống kỹ thuật đa tầng (MA20, MA200).
             """)
 
         rec = getattr(result, "recommendation", {})
@@ -537,7 +573,6 @@ if result is not None and inputs is not None:
         st.markdown("**Bảng Phân Tích Chuyên Sâu Từng Yếu Tố Của Danh Mục**")
         detail_data = []
         
-        # Đánh giá P/E
         pe = inputs.pe_current
         pe_min, pe_max = inputs.pe_min, inputs.pe_max
         if pe <= pe_min:
@@ -548,7 +583,6 @@ if result is not None and inputs is not None:
             pe_eval, pe_cmt = "Hợp Lý", "Định giá P/E nằm trong vùng trung tính, cân bằng giữa rủi ro và lợi nhuận."
         detail_data.append({"Chỉ số": "P/E", "Giá trị hiện tại": f"{pe:.2f}", "Ngưỡng (Min-Max)": f"{pe_min} - {pe_max}", "Đánh giá": pe_eval, "Nhận xét chi tiết": pe_cmt})
 
-        # Đánh giá P/B
         pb = inputs.pb_current
         pb_min, pb_max = inputs.pb_min, inputs.pb_max
         if pb <= pb_min:
@@ -559,7 +593,6 @@ if result is not None and inputs is not None:
             pb_eval, pb_cmt = "Hợp Lý", "Định giá P/B ở vùng an toàn và phù hợp với lịch sử."
         detail_data.append({"Chỉ số": "P/B", "Giá trị hiện tại": f"{pb:.2f}", "Ngưỡng (Min-Max)": f"{pb_min} - {pb_max}", "Đánh giá": pb_eval, "Nhận xét chi tiết": pb_cmt})
 
-        # Đánh giá ERP
         erp_est = (1 / pe) * 100 - inputs.rf if pe > 0 else 0
         erp_min, erp_max = inputs.erp_min, inputs.erp_max
         if erp_est >= erp_max:
@@ -570,7 +603,6 @@ if result is not None and inputs is not None:
             erp_eval, erp_cmt = "Trung Tính", "Phần bù rủi ro ở mức chấp nhận được cho việc nắm giữ dài hạn."
         detail_data.append({"Chỉ số": "ERP (Phần bù Rủi ro)", "Giá trị hiện tại": f"{erp_est:.2f}%", "Ngưỡng (Min-Max)": f"{erp_min}% - {erp_max}%", "Đánh giá": erp_eval, "Nhận xét chi tiết": erp_cmt})
 
-        # Đánh giá DY
         dy = inputs.dy_current
         dy_min, dy_max = inputs.dy_min, inputs.dy_max
         if dy >= dy_max:
@@ -581,27 +613,33 @@ if result is not None and inputs is not None:
             dy_eval, dy_cmt = "Trung Bình", "Mức chi trả cổ tức duy trì ổn định, cung cấp dòng tiền vừa đủ."
         detail_data.append({"Chỉ số": "Tỷ suất Cổ tức (DY)", "Giá trị hiện tại": f"{dy:.2f}%", "Ngưỡng (Min-Max)": f"{dy_min}% - {dy_max}%", "Đánh giá": dy_eval, "Nhận xét chi tiết": dy_cmt})
 
-        # Chất lượng ROE
         roe, roe_bench = inputs.roe_current, inputs.roe_benchmark
         roe_eval = "Tốt" if roe >= roe_bench else "Kém"
         detail_data.append({"Chỉ số": "Chất lượng (ROE)", "Giá trị hiện tại": f"{roe:.2f}%", "Ngưỡng (Min-Max)": f">= {roe_bench}%", "Đánh giá": roe_eval, "Nhận xét chi tiết": f"Hiệu quả sử dụng vốn chủ sở hữu {'đạt yêu cầu tích cực' if roe_eval=='Tốt' else 'chưa đạt kỳ vọng tối thiểu'}."})
 
-        # Tăng trưởng EPS
         eps, eps_bench = inputs.eps_growth_exp, inputs.eps_growth_benchmark
         eps_eval = "Tích Cực" if eps >= eps_bench else "Tiêu Cực"
         detail_data.append({"Chỉ số": "Tăng trưởng EPS", "Giá trị hiện tại": f"{eps:.2f}%", "Ngưỡng (Min-Max)": f">= {eps_bench}%", "Đánh giá": eps_eval, "Nhận xét chi tiết": f"Triển vọng tăng trưởng lợi nhuận {'đang mở rộng, hỗ trợ tăng giá' if eps_eval=='Tích Cực' else 'đang thu hẹp, tạo áp lực giảm giá'}."})
 
-        # Vĩ mô Mỹ (Lợi suất thực)
         us_real_yield = inputs.us10y - inputs.us_cpi
         ry_eval = "Rủi Ro Cao" if us_real_yield > 2.0 else "Nới Lỏng"
         detail_data.append({"Chỉ số": "Lợi suất thực (Mỹ)", "Giá trị hiện tại": f"{us_real_yield:.2f}%", "Ngưỡng (Min-Max)": "< 2.00%", "Đánh giá": ry_eval, "Nhận xét chi tiết": f"Môi trường vĩ mô quốc tế đang {'rút thanh khoản, gây áp lực mạnh lên định giá cổ phiếu' if ry_eval=='Rủi Ro Cao' else 'cung cấp thanh khoản dồi dào, thuận lợi cho dòng tiền'}."})
 
-        # Kỹ thuật MA200
+        # --- NÂNG CẤP BỘ LỌC KỸ THUẬT ĐA TẦNG (MA20 & MA200) ---
         price, ma200 = inputs.price_current, inputs.ma200
-        trend = "Uptrend" if price >= ma200 else "Downtrend"
-        detail_data.append({"Chỉ số": "Xu hướng (vs MA200)", "Giá trị hiện tại": f"{price:.1f}", "Ngưỡng (Min-Max)": f"MA200: {ma200}", "Đánh giá": trend, "Nhận xét chi tiết": f"Thị trường đang nằm {'trên' if trend=='Uptrend' else 'dưới'} đường trung bình dài hạn, củng cố đà {'tăng' if trend=='Uptrend' else 'giảm'}."})
+        ma20 = st.session_state.get("ma20", ma200) # Đọc giá trị MA20 từ session state
+        
+        if price >= ma200 and ma20 >= ma200:
+            tech_eval, tech_cmt = "Uptrend Mạnh", "Giá và dòng tiền ngắn hạn (MA20) đều nằm trên xu hướng dài hạn (MA200), tín hiệu rất an toàn."
+        elif price >= ma200 and ma20 < ma200:
+            tech_eval, tech_cmt = "Hồi Phục Yếu", "Giá ở trên MA200 nhưng MA20 nằm dưới MA200, cẩn trọng nhịp hồi kỹ thuật ngắn hạn."
+        elif price < ma200 and ma20 >= ma200:
+            tech_eval, tech_cmt = "Cảnh Báo Sớm", "Giá đã thủng xu hướng dài hạn nhưng MA20 còn đỡ, tiềm ẩn rủi ro chuyển pha giảm."
+        else:
+            tech_eval, tech_cmt = "Downtrend", "Cả giá, dòng tiền ngắn hạn và xu hướng dài hạn đều nằm dưới MA200, rủi ro cấu trúc rất cao."
 
-        # Kỹ thuật Volatility
+        detail_data.append({"Chỉ số": "Xu hướng Kỹ thuật (Đa tầng)", "Giá trị hiện tại": f"Giá: {price:.1f} | MA20: {ma20:.1f}", "Ngưỡng (Min-Max)": f"MA200: {ma200:.1f}", "Đánh giá": tech_eval, "Nhận xét chi tiết": tech_cmt})
+
         vol, vol_avg = inputs.volatility_current, inputs.volatility_avg
         vol_eval = "Rủi Ro Cao" if vol > vol_avg else "Ổn Định"
         detail_data.append({"Chỉ số": "Biến động (Volatility)", "Giá trị hiện tại": f"{vol:.2f}%", "Ngưỡng (Min-Max)": f"Avg: {vol_avg}%", "Đánh giá": vol_eval, "Nhận xét chi tiết": f"Trạng thái tâm lý thị trường đang {'dao động rất mạnh, tiềm ẩn rủi ro bẫy giá' if vol_eval=='Rủi Ro Cao' else 'ổn định, thuận lợi cho việc giữ vị thế'}."})
@@ -621,12 +659,15 @@ if result is not None and inputs is not None:
             df_logs = load_log_df() if SHEETS_ON else pd.DataFrame(st.session_state.log)
             if not df_logs.empty:
                 st.dataframe(df_logs, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "⬇️ Xuất log CSV",
-                    df_logs.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="vam_log_export.csv",
-                    mime="text/csv"
-                )
+                
+                if st.button("⬇️ Xuất log CSV (Tùy chọn thư mục)"):
+                    success, msg = save_local_file(
+                        df_logs, ".csv", [("CSV files", "*.csv")], "vam_log_export.csv"
+                    )
+                    if success:
+                        st.toast(f"✅ Đã lưu tại: {msg}", icon="💾")
+                    elif "Đã hủy" not in msg:
+                        st.error(msg)
             else:
                 st.info("Chưa có bản ghi lịch sử nào.")
         except Exception as exc:
