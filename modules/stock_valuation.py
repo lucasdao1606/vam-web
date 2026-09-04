@@ -2,7 +2,7 @@
 modules/stock_valuation.py - VAM Portfolio Allocator & HMM Market Clock
 Tích hợp:
 - Dữ liệu cơ bản, kỹ thuật và Volatility chuẩn hóa từ vnstock
-- Tham số vĩ mô độc lập từ Gemini AI (cơ chế cô lập lỗi, chống reset state)
+- Tham số vĩ mô độc lập từ Gemini AI (Hỗ trợ gemini-3.1-pro-preview & Dynamic Model Fallback)
 - NÂNG CẤP 1: Đồng hồ chu kỳ lượng hóa bằng xác suất chuyển pha mềm HMM (Soft Probabilities)
 - NÂNG CẤP 2: Bộ lọc Điều kiện Tài chính & Thanh khoản Nội địa (VN-FCI) trích xuất từ vnstock
 - NÂNG CẤP 3: Thuật toán Kiểm soát Ma sát Thực thi (Turnover Cap, Deadband & Execution Cost)
@@ -190,7 +190,7 @@ def render():
         }
 
     # ---------------------------------------------------------------------------
-    # NÂNG CẤP 3: Thuật toán Kiểm soát Ma sát Thực thi (Turnover Cap & Cost Engine)
+    # NÂNG CẤP 3: Thuật toán Kiểm soát Ma sát Thực thi
     # ---------------------------------------------------------------------------
     def calculate_execution_friction(
         raw_weights: dict,
@@ -200,12 +200,6 @@ def render():
         portfolio_nav_mil: float,
         deadband_pct: float = 3.0
     ) -> dict:
-        """
-        Lấy cảm hứng từ apply_turnover_limit trong mre_vam.py:
-        - Áp dụng Deadband dung sai loại bỏ nhiễu ngắn hạn.
-        - Giới hạn tốc độ đảo danh mục (Turnover Cap).
-        - Tính chi phí thuế phí và ma sát thực tế.
-        """
         keys = ["equity", "bond", "gold"]
         w_prev = np.array([curr_weights[k] for k in keys], dtype=float)
         w_desired = np.array([raw_weights[k] for k in keys], dtype=float)
@@ -213,7 +207,6 @@ def render():
         raw_diff = w_desired - w_prev
         turnover_raw = float(np.sum(np.abs(raw_diff)) / 2.0)
 
-        # 1. Deadband filter: Nếu tổng lệch < deadband thì không cần tái cân bằng
         if turnover_raw < deadband_pct:
             w_exec = w_prev.copy()
             status = "Giữ Nguyên (Độ lệch trong vùng dung sai < 3%)"
@@ -221,7 +214,6 @@ def render():
             turnover_actual = 0.0
         else:
             action_needed = True
-            # 2. Turnover cap: Co giãn tỷ lệ nếu vượt trần
             if turnover_raw > max_turnover_pct:
                 scale = max_turnover_pct / max(0.001, turnover_raw)
                 w_exec = w_prev + scale * raw_diff
@@ -232,10 +224,7 @@ def render():
                 status = "Thực thi toàn phần theo tỷ trọng mục tiêu VAM"
                 turnover_actual = turnover_raw
 
-        # Chuẩn hóa lại tổng = 100%
         w_exec = (w_exec / np.sum(w_exec)) * 100.0
-
-        # 3. Tính chi phí ma sát thực tế (VND)
         money_turnover = (turnover_actual / 100.0) * portfolio_nav_mil
         est_fee_cost = money_turnover * (fee_rate_pct / 100.0)
 
@@ -252,7 +241,7 @@ def render():
         }
 
     # ---------------------------------------------------------------------------
-    # Vẽ Biểu đồ Đồng hồ Chu kỳ (Plotly Polar Gauge) - Responsive & Auto-scaled
+    # Vẽ Biểu đồ Đồng hồ Chu kỳ (Plotly Polar Gauge)
     # ---------------------------------------------------------------------------
     def draw_market_clock_chart(clock_val: float):
         needle_angle = (clock_val % 12.0) * 30.0
@@ -500,37 +489,91 @@ def render():
 
     MISSING_PARAMS_KEYS = ["rf", "us10y", "us_cpi", "eps_growth_exp"]
 
+    # ---------------------------------------------------------------------------
+    # TỐI ƯU HÓA GEMINI API: Cập nhật model 3.1 & Dynamic ListModels Fallback
+    # ---------------------------------------------------------------------------
     def fetch_missing_params_via_gemini(api_key: str) -> dict:
         try:
             from google import genai
             from google.genai import types
         except ImportError:
             st.error("⚠️ Chưa cài đặt thư viện `google-genai`!")
-            return {}
+            return {"error": "Chưa cài đặt google-genai"}
 
         client = genai.Client(api_key=api_key.strip())
+        
         prompt = """
-        Bạn là chuyên gia kinh tế vĩ mô. DÙNG GOOGLE SEARCH để tìm thông số mới nhất tính đến hôm nay.
-        Chỉ trả về DUY NHẤT một chuỗi JSON thuần túy (số thập phân %, KHÔNG thêm bất kỳ ghi chú hay văn bản giải thích nào):
+        Bạn là chuyên gia kinh tế vĩ mô. DÙNG GOOGLE SEARCH để tìm các số liệu kinh tế vĩ mô mới nhất:
+        1. Lợi suất Trái phiếu Chính phủ Việt Nam 10 năm (VN10Y Yield).
+        2. Lợi suất Trái phiếu Kho bạc Mỹ 10 năm (US10Y Yield).
+        3. Lạm phát CPI Mỹ YoY kỳ công bố mới nhất.
+        4. Tăng trưởng EPS dự phóng bình quân cả năm của VN-Index / VN30 theo các CTCK lớn (VNDirect, SSI, HSC, VCI).
+
+        HÃY TRẢ VỀ DUY NHẤT MỘT KHỐI JSON (các giá trị là số thực phần trăm float, không kèm chữ %, không thêm text rác):
         {
-            "rf": float (Lợi suất TPCP Việt Nam 10Y - VN10Y hiện tại),
-            "us10y": float (Lợi suất TPCP Mỹ 10Y - US10Y hiện tại),
-            "us_cpi": float (Lạm phát CPI Mỹ YoY mới nhất),
-            "eps_growth_exp": float (Dự phóng tăng trưởng EPS bình quân rổ VN30/VN-Index năm nay theo CTCK)
+            "rf": float (lợi suất VN10Y),
+            "us10y": float (lợi suất US10Y),
+            "us_cpi": float (lạm phát CPI Mỹ YoY),
+            "eps_growth_exp": float (tăng trưởng EPS dự phóng VN30)
         }
         """
+
+        # Danh sách ưu tiên theo đề xuất mới nhất từ Google GenAI API
+        CANDIDATE_MODELS = [
+            "gemini-3.1-pro-preview",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+        ]
+
+        # Truy vấn danh sách model thực tế được cấp phép cho key này
         try:
-            response = client.models.generate_content(
-                model="gemini-1.5-pro",
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1, tools=[{"google_search": {}}]),
-            )
-            text_response = response.text.strip()
-            if "{" in text_response and "}" in text_response:
-                text_response = text_response[text_response.find("{"):text_response.rfind("}") + 1]
-            return json.loads(text_response)
-        except Exception as e:
-            return {"error": str(e)}
+            available_models = [m.name.replace("models/", "") for m in client.models.list() if "generateContent" in getattr(m, "supported_generation_methods", []) or "generateContent" in getattr(m, "supported_actions", [])]
+            # Đưa các model khả dụng lên đầu danh sách duyệt
+            for av_m in available_models:
+                if av_m not in CANDIDATE_MODELS and "embedding" not in av_m:
+                    CANDIDATE_MODELS.append(av_m)
+        except Exception:
+            pass
+
+        last_err = ""
+
+        for model_name in CANDIDATE_MODELS:
+            try:
+                # Không ép cứng response_mime_type khi bật google_search để tương thích với tất cả model
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        tools=[{"google_search": {}}]
+                    ),
+                )
+                
+                raw_text = response.text.strip() if response.text else ""
+                
+                # Bóc tách khối JSON bằng Regex
+                match = re.search(r"\{[\s\S]*?\}", raw_text)
+                if match:
+                    json_str = match.group(0)
+                    data = json.loads(json_str)
+                    
+                    cleaned_data = {}
+                    for k in MISSING_PARAMS_KEYS:
+                        if k in data and data[k] is not None:
+                            try:
+                                cleaned_data[k] = float(data[k])
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    if len(cleaned_data) >= 2:
+                        return cleaned_data
+
+            except Exception as exc:
+                last_err = f"[{model_name}] {exc}"
+                continue
+
+        return {"error": f"Không có model nào phản hồi thành công. Lỗi cuối: {last_err}"}
 
     def draw_plotly_pie_chart(weights, labels, colors, center_text="TARGET"):
         fig = go.Figure(data=[go.Pie(
@@ -586,7 +629,7 @@ def render():
                 st.sidebar.warning("⚠️ Vui lòng nạp Gemini API Key trước!")
             else:
                 try:
-                    with st.spinner("🤖 Gemini đang truy xuất vĩ mô..."):
+                    with st.spinner("🤖 Gemini đang truy xuất vĩ mô với bộ lọc Fallback..."):
                         missing_data = fetch_missing_params_via_gemini(api_key)
                         
                         if missing_data and "error" not in missing_data and isinstance(missing_data, dict):
@@ -772,7 +815,6 @@ def render():
         "bond": float(st.session_state.get("curr_w_bond", 25.0)),
         "gold": float(st.session_state.get("curr_w_gold", 15.0)),
     }
-    # Chuẩn hóa tổng current weight = 100%
     curr_sum = sum(curr_w.values())
     if curr_sum > 0:
         curr_w = {k: (v / curr_sum) * 100.0 for k, v in curr_w.items()}
@@ -786,7 +828,6 @@ def render():
     )
     exec_w = frict_res["exec_weights"]
 
-    # Hiển thị song song: Đồng hồ Chu kỳ và Biểu đồ Phân bổ Thực thi
     c_graph1, c_graph2 = st.columns([1, 1])
 
     with c_graph1:
@@ -832,7 +873,7 @@ def render():
         st.plotly_chart(fig_pie, use_container_width=True, config={"responsive": True})
 
     # ---------------------------------------------------------------------------
-    # NÂNG CẤP 3: Thẻ Đo lường Ma sát & Chi phí Thực thi (Turnover & Cost Dashboard)
+    # Thẻ Đo lường Ma sát & Chi phí Thực thi (Turnover & Cost Dashboard)
     # ---------------------------------------------------------------------------
     st.markdown("---")
     st.subheader("⚖️ Bảng Thực thi & Kiểm soát Ma sát Đảo danh mục (Turnover Safeguard)")
@@ -853,7 +894,6 @@ def render():
         st.success(f"✅ **Trạng thái thực thi:** {frict_res['status']}. "
                    f"Lợi ích điều chỉnh không bù đắp được chi phí ma sát và trượt giá. Danh mục được khuyến nghị giữ nguyên trạng thái.")
 
-    # Chỉ số & Khuyến nghị VAM
     st.markdown("---")
     m1, m2, m3, m4, m5 = st.columns([1.2, 1, 1, 1, 1])
     m1.metric("VAM Valuation Score", f"{result.valuation_score:.2f}")
@@ -869,7 +909,6 @@ def render():
     rule_text = getattr(result, "rule_text", "")
     st.info(f"**⚖️ Quy tắc:** {rule_text}\n\n**📢 Hành động:** `{action}` - **{headline}**\n\n**📝 Chi tiết:** {detail}")
 
-    # Tabs Đánh giá chi tiết & Logs
     tab1, tab2 = st.tabs(["🔍 Bảng So sánh Tỷ trọng & Chi tiết Chỉ số", "📜 Lịch sử lưu Google Sheets"])
 
     with tab1:
