@@ -1,0 +1,7 @@
+pandas>=2.2
+numpy>=1.26
+fredapi>=0.5.2
+hmmlearn>=0.3.3
+scikit-learn>=1.4
+matplotlib>=3.8
+yfinance>=0.2.40

@@ -1,0 +1,20 @@
+# Môi trường ảo Python
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+
+# Khóa API, Secrets và Credentials (RẤT QUAN TRỌNG)
+*.env
+*.json
+service_account.json
+gemini_key.json
+vam_input_config.json
+
+# File log, cache hệ thống
+*.log
+.streamlit/secrets.toml
+mre_vam_output/
+.DS_Store
+Thumbs.db
