@@ -487,11 +487,11 @@ def render():
         status_box.update(label="✅ Hoàn tất lấy dữ liệu từ vnstock!", state="complete", expanded=False)
         return results
 
+    # ---------------------------------------------------------------------------
+    # TỐI ƯU HÓA GEMINI API: Tập trung vào 4 Snapshot vĩ mô hiệu quả cao nhất
+    # ---------------------------------------------------------------------------
     MISSING_PARAMS_KEYS = ["rf", "us10y", "us_cpi", "eps_growth_exp"]
 
-    # ---------------------------------------------------------------------------
-    # TỐI ƯU HÓA GEMINI API: Cập nhật model 3.1 & Dynamic ListModels Fallback
-    # ---------------------------------------------------------------------------
     def fetch_missing_params_via_gemini(api_key: str) -> dict:
         try:
             from google import genai
@@ -503,22 +503,23 @@ def render():
         client = genai.Client(api_key=api_key.strip())
         
         prompt = """
-        Bạn là chuyên gia kinh tế vĩ mô. DÙNG GOOGLE SEARCH để tìm các số liệu kinh tế vĩ mô mới nhất:
-        1. Lợi suất Trái phiếu Chính phủ Việt Nam 10 năm (VN10Y Yield).
-        2. Lợi suất Trái phiếu Kho bạc Mỹ 10 năm (US10Y Yield).
-        3. Lạm phát CPI Mỹ YoY kỳ công bố mới nhất.
-        4. Tăng trưởng EPS dự phóng bình quân cả năm của VN-Index / VN30 theo các CTCK lớn (VNDirect, SSI, HSC, VCI).
+        Bạn là chuyên gia phân tích kinh tế vĩ mô và định lượng đầu tư. 
+        Hãy DÙNG GOOGLE SEARCH để tra cứu chính xác 4 chỉ số vĩ mô cập nhật mới nhất tính đến thời điểm hiện tại:
 
-        HÃY TRẢ VỀ DUY NHẤT MỘT KHỐI JSON (các giá trị là số thực phần trăm float, không kèm chữ %, không thêm text rác):
+        1. 'rf': Lợi suất Trái phiếu Chính phủ Việt Nam kỳ hạn 10 năm (VN10Y Government Bond Yield, đơn vị %). Tra cứu từ nguồn HNX, Kho bạc Nhà nước, hoặc cổng thông tin tài chính (Vietstock, Investing.com).
+        2. 'us10y': Lợi suất Trái phiếu Kho bạc Mỹ kỳ hạn 10 năm (US 10-Year Treasury Yield, đơn vị %). Tra cứu từ US Treasury, MarketWatch hoặc CNBC.
+        3. 'us_cpi': Chỉ số Lạm phát CPI của Mỹ theo năm (US CPI YoY %, số liệu chính thức kỳ công bố mới nhất từ Cục Thống kê Lao động Mỹ BLS).
+        4. 'eps_growth_exp': Mức dự phóng tăng trưởng lợi nhuận/EPS bình quân cả năm của VN-Index / VN30 (đơn vị %) dựa trên các báo cáo chiến lược thị trường mới nhất của các công ty chứng khoán lớn (VNDirect, SSI Research, HSC, Vietcap).
+
+        HÃY CHỈ TRẢ VỀ DUY NHẤT MỘT KHỐI JSON HỢP LỆ (các giá trị là số thực phần trăm float, không kèm ký tự '%', không thêm bất kỳ văn bản giải thích nào khác):
         {
-            "rf": float (lợi suất VN10Y),
-            "us10y": float (lợi suất US10Y),
-            "us_cpi": float (lạm phát CPI Mỹ YoY),
-            "eps_growth_exp": float (tăng trưởng EPS dự phóng VN30)
+            "rf": float,
+            "us10y": float,
+            "us_cpi": float,
+            "eps_growth_exp": float
         }
         """
 
-        # Danh sách ưu tiên theo đề xuất mới nhất từ Google GenAI API
         CANDIDATE_MODELS = [
             "gemini-3.1-pro-preview",
             "gemini-2.5-flash",
@@ -526,10 +527,8 @@ def render():
             "gemini-1.5-flash",
         ]
 
-        # Truy vấn danh sách model thực tế được cấp phép cho key này
         try:
             available_models = [m.name.replace("models/", "") for m in client.models.list() if "generateContent" in getattr(m, "supported_generation_methods", []) or "generateContent" in getattr(m, "supported_actions", [])]
-            # Đưa các model khả dụng lên đầu danh sách duyệt
             for av_m in available_models:
                 if av_m not in CANDIDATE_MODELS and "embedding" not in av_m:
                     CANDIDATE_MODELS.append(av_m)
@@ -540,7 +539,6 @@ def render():
 
         for model_name in CANDIDATE_MODELS:
             try:
-                # Không ép cứng response_mime_type khi bật google_search để tương thích với tất cả model
                 response = client.models.generate_content(
                     model=model_name,
                     contents=prompt,
@@ -552,7 +550,6 @@ def render():
                 
                 raw_text = response.text.strip() if response.text else ""
                 
-                # Bóc tách khối JSON bằng Regex
                 match = re.search(r"\{[\s\S]*?\}", raw_text)
                 if match:
                     json_str = match.group(0)
