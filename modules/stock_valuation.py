@@ -12,7 +12,9 @@ Tích hợp:
 - NÂNG CẤP 8: Bảo mật Write-Only cho các trường API
 - NÂNG CẤP 9: Báo cáo Telegram đầy đủ và chi tiết như giao diện UI
 - NÂNG CẤP 10: Tự động Forward tin nhắn từ Admin lên Public Channel
-- NÂNG CẤP 11: Tự động lưu trữ và đồng bộ vào stock_database.csv (Tương tự crypto_database)
+- NÂNG CẤP 11: Tự động lưu trữ và đồng bộ vào stock_database.csv
+- NÂNG CẤP 12: Bộ Scheduler độc lập (stock_scheduler) chống xung đột
+- FIX BUG: Sửa lỗi TypeError stock_scheduler.next_run (chuyển method -> property)
 """
 
 import json
@@ -36,6 +38,9 @@ from vam_core import VAMInputs, compute
 from sheets_log import sheets_configured, append_log_row, load_log_df, make_log_row
 
 STOCK_DB_FILE = "stock_database.csv"
+
+# Khởi tạo Scheduler độc lập cho riêng Stock
+stock_scheduler = schedule.Scheduler()
 
 # Khởi tạo File Logging cho quá trình chạy ngầm
 logging.basicConfig(
@@ -108,7 +113,6 @@ GLOBAL_CONFIG = {}
 # CƠ CHẾ LƯU TRỮ VÀ QUẢN TRỊ FILE stock_database.csv
 # ---------------------------------------------------------------------------
 def load_stock_database(db_path: str = STOCK_DB_FILE) -> pd.DataFrame:
-    """Đọc toàn bộ cơ sở dữ liệu đã lưu trữ từ stock_database.csv."""
     if os.path.exists(db_path):
         try:
             return pd.read_csv(db_path, encoding="utf-8-sig")
@@ -117,10 +121,6 @@ def load_stock_database(db_path: str = STOCK_DB_FILE) -> pd.DataFrame:
     return pd.DataFrame()
 
 def save_stock_database(inputs: VAMInputs, result, frict_res: dict, clock_data: dict, curr_w: dict, note: str = "", db_path: str = STOCK_DB_FILE) -> bool:
-    """
-    Tự động ghi lại toàn bộ các thông số định giá, chu kỳ HMM, và phân bổ vào stock_database.csv.
-    Sử dụng utf-8-sig để Excel trên Windows hiển thị chuẩn và chống crash.
-    """
     try:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         ts_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -147,7 +147,6 @@ def save_stock_database(inputs: VAMInputs, result, frict_res: dict, clock_data: 
                 "target_weight_pct": round(float(tgt), 2),
                 "exec_weight_pct": round(float(exc), 2),
                 "drift_pct": round(float(exc - cur), 2),
-                # Bối cảnh Định giá VAM
                 "valuation_score": round(float(result.valuation_score), 2),
                 "withdrawal_rate_pct": round(float(result.withdrawal_rate), 2),
                 "rebalance_action_needed": frict_res.get("action_needed", False),
@@ -155,7 +154,6 @@ def save_stock_database(inputs: VAMInputs, result, frict_res: dict, clock_data: 
                 "actual_turnover_pct": round(float(frict_res.get("actual_turnover", 0.0)), 2),
                 "money_turnover_mil": round(float(frict_res.get("money_turnover", 0.0)), 2),
                 "est_fee_cost_vnd": round(float(frict_res.get("est_fee_cost", 0.0) * 1e6), 0),
-                # Đồng hồ chu kỳ HMM & Thanh khoản
                 "hmm_hour": round(float(clock_data.get("hour", 0.0)), 2),
                 "hmm_time_str": clock_data.get("time_str", ""),
                 "hmm_phase": clock_data.get("phase", ""),
@@ -165,7 +163,6 @@ def save_stock_database(inputs: VAMInputs, result, frict_res: dict, clock_data: 
                 "prob_expansion": round(float(clock_data.get("probabilities", {}).get("Expansion", 0.0)), 4),
                 "prob_slowdown": round(float(clock_data.get("probabilities", {}).get("Slowdown", 0.0)), 4),
                 "prob_recession": round(float(clock_data.get("probabilities", {}).get("Recession", 0.0)), 4),
-                # Thông số kỹ thuật & Vĩ mô
                 "vnindex_price": round(float(inputs.price_current), 2),
                 "vnindex_ma20": round(float(getattr(inputs, "ma20", inputs.ma200)), 2),
                 "vnindex_ma200": round(float(inputs.ma200), 2),
@@ -190,7 +187,7 @@ def save_stock_database(inputs: VAMInputs, result, frict_res: dict, clock_data: 
             df_new.to_csv(db_path, mode="a", header=False, index=False, encoding="utf-8-sig")
         return True
     except PermissionError:
-        logging.warning(f"File {db_path} đang mở trong ứng dụng khác. Tạm thời không ghi được.")
+        logging.warning(f"File {db_path} đang mở trong ứng dụng khác.")
         return False
     except Exception as e:
         logging.error(f"Lỗi lưu trữ {db_path}: {e}")
@@ -418,7 +415,7 @@ def fetch_missing_params_via_gemini(api_key: str, log_func=print) -> dict:
     return {"error": "Lỗi API"}
 
 # ---------------------------------------------------------------------------
-# TIẾN TRÌNH BACKGROUND (LẬP LỊCH & LẮNG NGHE ĐỘC LẬP)
+# TIẾN TRÌNH BACKGROUND ĐỘC LẬP
 # ---------------------------------------------------------------------------
 def automated_job():
     print("[TELEGRAM BOT] Bắt đầu kích hoạt tiến trình báo cáo VAM tự động...")
@@ -480,7 +477,6 @@ def automated_job():
     bank_b = float(job_config.get("bank_breadth", 50.0))
     clock_data = calculate_hmm_market_clock(inputs, ma20_curr, vol_r, bank_b)
     
-    # TỰ ĐỘNG GHI LƯU VÀO stock_database.csv
     save_stock_database(inputs, result, frict_res, clock_data, curr_w, note="Automated Job Background")
 
     if notify_mode == "Chỉ gửi khi vượt ngưỡng thực thi" and not frict_res["action_needed"]:
@@ -544,19 +540,18 @@ def run_schedule_and_polling():
     
     token = GLOBAL_CONFIG.get("telegram_token")
     if token:
-        print("\n[TELEGRAM BOT] 1. Đang dọn dẹp cấu hình Webhook cũ...")
         try:
             requests.post(f"https://api.telegram.org/bot{token}/deleteWebhook", timeout=5)
-        except Exception as e:
-            print(f"[TELEGRAM BOT] Lỗi xóa Webhook: {e}")
+        except Exception:
+            pass
             
     print("[TELEGRAM BOT] 2. Bắt đầu tiến trình Lập lịch & Lắng nghe tin nhắn ngầm...\n")
 
     while True:
         try:
-            schedule.run_pending()
+            stock_scheduler.run_pending()
         except Exception as e:
-            print(f"[TELEGRAM BOT] Lỗi Schedule: {e}")
+            logging.error(f"[STOCK BOT] Lỗi Schedule: {e}")
             
         token = GLOBAL_CONFIG.get("telegram_token")
         admin_id = str(GLOBAL_CONFIG.get("telegram_chat_id", "")).strip()
@@ -585,15 +580,11 @@ def run_schedule_and_polling():
                             print(f"[TELEGRAM BOT] [Nhận] Tin nhắn mới từ ID {chat_id}: {text_preview}...")
                             
                             if chat_id == admin_id and message_id:
-                                print(f"   ⏳ Đang thực hiện lệnh forward lên Channel {channel_id}...")
                                 success = forward_telegram_msg(token, channel_id, chat_id, message_id)
                                 if success:
                                     print("   ✅ Forward thành công!")
                                 else:
-                                    print("   ❌ Lỗi forward: Kiểm tra lại quyền Post Messages trong Channel.")
-                            else:
-                                if chat_id != admin_id:
-                                    print(f"   ⚠️ Bỏ qua: ID người gửi ({chat_id}) không khớp Admin ID ({admin_id}).")
+                                    print("   ❌ Lỗi forward: Kiểm tra quyền Channel.")
             except Exception:
                 pass
         time.sleep(2)
@@ -805,18 +796,23 @@ def render():
 
         current_schedule_config = f"{st.session_state.schedule_mode}_{st.session_state.schedule_time}"
         if st.session_state.get("last_schedule_config") != current_schedule_config:
-            schedule.clear()
+            stock_scheduler.clear()
             mode = st.session_state.schedule_mode
             run_time = st.session_state.schedule_time
             
-            if mode == "Hàng ngày": schedule.every().day.at(run_time).do(automated_job)
-            elif mode == "Hàng tuần": schedule.every().monday.at(run_time).do(automated_job)
-            elif mode == "Hàng tháng": schedule.every(30).days.at(run_time).do(automated_job)
+            if mode == "Hàng ngày": stock_scheduler.every().day.at(run_time).do(automated_job)
+            elif mode == "Hàng tuần": stock_scheduler.every().monday.at(run_time).do(automated_job)
+            elif mode == "Hàng tháng": stock_scheduler.every(30).days.at(run_time).do(automated_job)
                 
             st.session_state.last_schedule_config = current_schedule_config
             logging.info(f"Đã cập nhật lịch trình mới: {current_schedule_config}")
             
-        next_run = schedule.next_run()
+        # SỬA LỖI TẠI ĐÂY: Dùng thuộc tính next_run thay vì gọi hàm next_run()
+        next_run = getattr(stock_scheduler, "next_run", None)
+        if callable(next_run):
+            try: next_run = next_run()
+            except Exception: next_run = None
+            
         if next_run:
             st.caption(f"⏳ Lần chạy tiếp theo: **{next_run.strftime('%Y-%m-%d %H:%M:%S')}** (Theo giờ Server)")
         else:
@@ -917,7 +913,6 @@ def render():
         frict_res_temp = calculate_execution_friction({"equity": result.equity_weight, "bond": result.bond_weight, "gold": result.gold_weight}, curr_w_temp, st.session_state.max_turnover, st.session_state.fee_rate, st.session_state.portfolio_nav)
         clock_data_temp = calculate_hmm_market_clock(inputs, float(st.session_state.get("ma20", inputs.ma200)), float(st.session_state.get("vol_ratio", 1.0)), float(st.session_state.get("bank_breadth", 50.0)))
 
-        # TỰ ĐỘNG GHI LƯU VÀO stock_database.csv KHI BẤM NÚT
         if save_stock_database(inputs, result, frict_res_temp, clock_data_temp, curr_w_temp, note=st.session_state.investment_notes):
             st.toast("✅ Đã cập nhật & đồng bộ dữ liệu vào stock_database.csv!", icon="💾")
 

@@ -5,6 +5,7 @@ Tích hợp:
 - Báo cáo Telegram chi tiết, đa tầng tương tự bản TTCK
 - Lập lịch tự động gửi báo cáo Telegram & Forward Channel
 - Tự động đồng bộ và lưu trữ toàn bộ tham số vào crypto_database.csv
+- Bộ Scheduler độc lập (crypto_scheduler) chống xung đột
 - Tab tra cứu, lọc lịch sử và nút Download file CSV tiện lợi
 """
 
@@ -40,6 +41,8 @@ from modules.stock_valuation import (
     GLOBAL_CONFIG as STOCK_GLOBAL_CONFIG
 )
 
+# Khởi tạo Scheduler độc lập cho riêng Crypto
+crypto_scheduler = schedule.Scheduler()
 CRYPTO_GLOBAL_CONFIG = {}
 
 # ---------------------------------------------------------------------------
@@ -160,7 +163,7 @@ def automated_crypto_job():
 def run_crypto_scheduler():
     while True:
         try:
-            schedule.run_pending()
+            crypto_scheduler.run_pending()
         except Exception as e:
             logging.error(f"[CRYPTO BOT] Lỗi schedule: {e}")
         time.sleep(2)
@@ -275,15 +278,15 @@ def render():
 
         cfg_key = f"crypto_{st.session_state.crypto_schedule_mode}_{st.session_state.crypto_schedule_time}"
         if st.session_state.get("last_crypto_schedule_cfg") != cfg_key:
-            schedule.clear("crypto_jobs")
+            crypto_scheduler.clear()
             m = st.session_state.crypto_schedule_mode
             t = st.session_state.crypto_schedule_time
             if m == "Hàng ngày":
-                schedule.every().day.at(t).do(automated_crypto_job).tag("crypto_jobs")
+                crypto_scheduler.every().day.at(t).do(automated_crypto_job)
             elif m == "Hàng tuần":
-                schedule.every().monday.at(t).do(automated_crypto_job).tag("crypto_jobs")
+                crypto_scheduler.every().monday.at(t).do(automated_crypto_job)
             elif m == "Hàng tháng":
-                schedule.every(30).days.at(t).do(automated_crypto_job).tag("crypto_jobs")
+                crypto_scheduler.every(30).days.at(t).do(automated_crypto_job)
             st.session_state.last_crypto_schedule_cfg = cfg_key
 
         c_btn1, c_btn2 = st.columns(2)
@@ -330,7 +333,6 @@ def render():
     data = st.session_state.last_crypto_data
     vam_market = data["vam_market_final"]
 
-    # Header Card
     if vam_market < 35.0:
         c_bg, c_border, status_txt = "#064E3B", "#10B981", "CHIẾT KHẤU CAO (Undervalued) - Tích lũy tối đa"
     elif vam_market > 68.0:
@@ -359,7 +361,6 @@ def render():
         unsafe_allow_html=True
     )
 
-    # 4 Metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Bitcoin (BTC) VAM", f"{data['btc_score']:.2f}")
     m2.metric("Altcoins Top 5 VAM", f"{data['altcoin_index']:.2f}")

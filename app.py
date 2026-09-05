@@ -12,6 +12,10 @@ st.set_page_config(
     layout="wide"
 )
 
+# KÍCH HOẠT 2 TIẾN TRÌNH LẬP LỊCH CHẠY NGẦM ĐỘC LẬP NGAY TỪ ĐẦU
+stock_valuation.start_background_bot()
+crypto_valuation.start_crypto_background_worker()
+
 NAV_MODULES = {
     "🏛️ Định giá TTCK (VAM Core)": stock_valuation.render,
     "💼 Quản lý Danh mục": portfolio_mgmt.render,
