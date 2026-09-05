@@ -1,11 +1,13 @@
-﻿# Streamlit secrets
+﻿# Streamlit secrets & keys
 .streamlit/secrets.toml
 secrets.toml
-
-# Key mã hóa Fernet & Vault cục bộ
 .fernet_key
 *.enc
 
-# File cơ sở dữ liệu và log cục bộ
+# Cơ sở dữ liệu và file logs
 *.csv
 *.log
+
+# Python cache
+__pycache__/
+*.py[cod]

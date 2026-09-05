@@ -12,7 +12,7 @@ Tích hợp:
 - NÂNG CẤP 8: Bảo mật Write-Only cho các trường API
 - NÂNG CẤP 9: Báo cáo Telegram đầy đủ và chi tiết như giao diện UI
 - NÂNG CẤP 10: Tự động Forward tin nhắn từ Admin lên Public Channel
-- HOTFIX 3: Đồng bộ logic Forward chủ động cho hàm Lập lịch tự động (Automated Job)
+- NÂNG CẤP 11: Tự động lưu trữ và đồng bộ vào stock_database.csv (Tương tự crypto_database)
 """
 
 import json
@@ -20,7 +20,7 @@ import re
 import time
 import os
 import math
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import threading
 import schedule
 import requests
@@ -34,6 +34,8 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 from vam_core import VAMInputs, compute
 from sheets_log import sheets_configured, append_log_row, load_log_df, make_log_row
+
+STOCK_DB_FILE = "stock_database.csv"
 
 # Khởi tạo File Logging cho quá trình chạy ngầm
 logging.basicConfig(
@@ -103,6 +105,98 @@ SENSITIVE_KEYS = {"gemini_api_key", "telegram_token", "telegram_chat_id", "teleg
 GLOBAL_CONFIG = {}
 
 # ---------------------------------------------------------------------------
+# CƠ CHẾ LƯU TRỮ VÀ QUẢN TRỊ FILE stock_database.csv
+# ---------------------------------------------------------------------------
+def load_stock_database(db_path: str = STOCK_DB_FILE) -> pd.DataFrame:
+    """Đọc toàn bộ cơ sở dữ liệu đã lưu trữ từ stock_database.csv."""
+    if os.path.exists(db_path):
+        try:
+            return pd.read_csv(db_path, encoding="utf-8-sig")
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+def save_stock_database(inputs: VAMInputs, result, frict_res: dict, clock_data: dict, curr_w: dict, note: str = "", db_path: str = STOCK_DB_FILE) -> bool:
+    """
+    Tự động ghi lại toàn bộ các thông số định giá, chu kỳ HMM, và phân bổ vào stock_database.csv.
+    Sử dụng utf-8-sig để Excel trên Windows hiển thị chuẩn và chống crash.
+    """
+    try:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        exec_w = frict_res.get("exec_weights", {})
+        rec = getattr(result, "recommendation", {})
+
+        asset_map = [
+            ("Cổ phiếu", "equity", curr_w.get("equity", 0.0), result.equity_weight, exec_w.get("equity", 0.0)),
+            ("Trái phiếu", "bond", curr_w.get("bond", 0.0), result.bond_weight, exec_w.get("bond", 0.0)),
+            ("Vàng", "gold", curr_w.get("gold", 0.0), result.gold_weight, exec_w.get("gold", 0.0))
+        ]
+
+        records = []
+        for name_vn, key, cur, tgt, exc in asset_map:
+            records.append({
+                "run_id": run_id,
+                "timestamp": ts_local,
+                "timestamp_utc": ts_utc,
+                "asset": name_vn,
+                "asset_key": key,
+                "current_weight_pct": round(float(cur), 2),
+                "target_weight_pct": round(float(tgt), 2),
+                "exec_weight_pct": round(float(exc), 2),
+                "drift_pct": round(float(exc - cur), 2),
+                # Bối cảnh Định giá VAM
+                "valuation_score": round(float(result.valuation_score), 2),
+                "withdrawal_rate_pct": round(float(result.withdrawal_rate), 2),
+                "rebalance_action_needed": frict_res.get("action_needed", False),
+                "rebalance_status": frict_res.get("status", ""),
+                "actual_turnover_pct": round(float(frict_res.get("actual_turnover", 0.0)), 2),
+                "money_turnover_mil": round(float(frict_res.get("money_turnover", 0.0)), 2),
+                "est_fee_cost_vnd": round(float(frict_res.get("est_fee_cost", 0.0) * 1e6), 0),
+                # Đồng hồ chu kỳ HMM & Thanh khoản
+                "hmm_hour": round(float(clock_data.get("hour", 0.0)), 2),
+                "hmm_time_str": clock_data.get("time_str", ""),
+                "hmm_phase": clock_data.get("phase", ""),
+                "fci_score": round(float(clock_data.get("fci_score", 0.0)), 2),
+                "fci_state": clock_data.get("fci_state", ""),
+                "prob_recovery": round(float(clock_data.get("probabilities", {}).get("Recovery", 0.0)), 4),
+                "prob_expansion": round(float(clock_data.get("probabilities", {}).get("Expansion", 0.0)), 4),
+                "prob_slowdown": round(float(clock_data.get("probabilities", {}).get("Slowdown", 0.0)), 4),
+                "prob_recession": round(float(clock_data.get("probabilities", {}).get("Recession", 0.0)), 4),
+                # Thông số kỹ thuật & Vĩ mô
+                "vnindex_price": round(float(inputs.price_current), 2),
+                "vnindex_ma20": round(float(getattr(inputs, "ma20", inputs.ma200)), 2),
+                "vnindex_ma200": round(float(inputs.ma200), 2),
+                "volatility_current": round(float(inputs.volatility_current), 2),
+                "volatility_avg": round(float(inputs.volatility_avg), 2),
+                "drawdown_pct": round(float(inputs.drawdown_pct), 2),
+                "pe_current": round(float(inputs.pe_current), 2),
+                "pb_current": round(float(inputs.pb_current), 2),
+                "roe_current": round(float(inputs.roe_current), 2),
+                "rf_pct": round(float(inputs.rf), 2),
+                "us10y_pct": round(float(inputs.us10y), 2),
+                "us_cpi_pct": round(float(inputs.us_cpi), 2),
+                "recommendation_action": rec.get("action", ""),
+                "recommendation_headline": rec.get("headline", ""),
+                "investment_note": note
+            })
+
+        df_new = pd.DataFrame(records)
+        if not os.path.exists(db_path):
+            df_new.to_csv(db_path, mode="w", index=False, encoding="utf-8-sig")
+        else:
+            df_new.to_csv(db_path, mode="a", header=False, index=False, encoding="utf-8-sig")
+        return True
+    except PermissionError:
+        logging.warning(f"File {db_path} đang mở trong ứng dụng khác. Tạm thời không ghi được.")
+        return False
+    except Exception as e:
+        logging.error(f"Lỗi lưu trữ {db_path}: {e}")
+        return False
+
+# ---------------------------------------------------------------------------
 # API LIÊN KẾT BÊN NGOÀI
 # ---------------------------------------------------------------------------
 def send_telegram_msg(token, chat_id, message):
@@ -133,7 +227,7 @@ def forward_telegram_msg(token, target_chat_id, from_chat_id, message_id):
         return False
 
 # ---------------------------------------------------------------------------
-# LOGIC TÍNH TOÁN CORE (Tách biệt hoàn toàn khỏi UI)
+# LOGIC TÍNH TOÁN CORE
 # ---------------------------------------------------------------------------
 def calculate_hmm_market_clock(inputs: VAMInputs, ma20_val: float, vol_ratio: float, bank_breadth: float) -> dict:
     pe_norm = (inputs.pe_current - inputs.pe_min) / max(0.01, (inputs.pe_max - inputs.pe_min))
@@ -381,15 +475,18 @@ def automated_job():
 
     frict_res = calculate_execution_friction(raw_weights=raw_w, curr_weights=curr_w, max_turnover_pct=float(job_config.get("max_turnover", 25.0)), fee_rate_pct=float(job_config.get("fee_rate", 0.15)), portfolio_nav_mil=float(job_config.get("portfolio_nav", 1000.0)))
 
-    if notify_mode == "Chỉ gửi khi vượt ngưỡng thực thi" and not frict_res["action_needed"]:
-        print("[TELEGRAM BOT] Bỏ qua gửi báo cáo do tỷ trọng chưa vượt ngưỡng thực thi.")
-        return
-
     ma20_curr = float(job_config.get("ma20", inputs.ma200))
     vol_r = float(job_config.get("vol_ratio", 1.0))
     bank_b = float(job_config.get("bank_breadth", 50.0))
     clock_data = calculate_hmm_market_clock(inputs, ma20_curr, vol_r, bank_b)
     
+    # TỰ ĐỘNG GHI LƯU VÀO stock_database.csv
+    save_stock_database(inputs, result, frict_res, clock_data, curr_w, note="Automated Job Background")
+
+    if notify_mode == "Chỉ gửi khi vượt ngưỡng thực thi" and not frict_res["action_needed"]:
+        print("[TELEGRAM BOT] Bỏ qua gửi báo cáo do tỷ trọng chưa vượt ngưỡng thực thi.")
+        return
+
     exec_w = frict_res["exec_weights"]
     rec = getattr(result, "recommendation", {})
 
@@ -423,7 +520,7 @@ def automated_job():
     msg += f"- <b>Định giá:</b> P/E {inputs.pe_current:.2f} | P/B {inputs.pb_current:.2f}\n"
     msg += f"- <b>Động lượng:</b> Vol Ratio {vol_r:.2f}x | Ngân hàng > MA50: {bank_b:.1f}%\n"
     msg += f"- <b>Vĩ mô:</b> Rf {inputs.rf:.2f}% | US10Y {inputs.us10y:.2f}% | US CPI {inputs.us_cpi:.2f}%\n\n"
-    msg += f"📝 <i>Dữ liệu cập nhật tự động từ vnstock & Gemini.</i>"
+    msg += f"💾 <i>Dữ liệu cập nhật & lưu trữ tự động vào stock_database.csv.</i>"
     
     print("[TELEGRAM BOT] Đang gửi báo cáo qua Telegram...")
     msg_id = send_telegram_msg(token, chat_id, msg)
@@ -465,7 +562,6 @@ def run_schedule_and_polling():
         admin_id = str(GLOBAL_CONFIG.get("telegram_chat_id", "")).strip()
         channel_id = str(GLOBAL_CONFIG.get("telegram_channel_id", "")).strip()
         
-        # Tự động gán '@' cho tên channel nếu người dùng quên nhập
         if channel_id and not channel_id.startswith("-") and not channel_id.startswith("@"):
             channel_id = "@" + channel_id
             
@@ -563,12 +659,10 @@ def render():
 
     if "log" not in st.session_state: st.session_state.log = []
 
-    # Đồng bộ cấu hình thời gian thực ra GLOBAL_CONFIG cho Background Thread
     global GLOBAL_CONFIG
     GLOBAL_CONFIG.clear()
     GLOBAL_CONFIG.update(st.session_state)
 
-    # Đảm bảo luồng ngầm khởi động 1 lần duy nhất
     start_background_bot()
 
     # ---------------------------------------------------------------------------
@@ -816,6 +910,17 @@ def render():
         st.session_state.last_result = result
         st.session_state.last_inputs = inputs
 
+        curr_w_temp = {"equity": st.session_state.curr_w_equity, "bond": st.session_state.curr_w_bond, "gold": st.session_state.curr_w_gold}
+        curr_sum = sum(curr_w_temp.values())
+        if curr_sum > 0: curr_w_temp = {k: (v / curr_sum) * 100.0 for k, v in curr_w_temp.items()}
+
+        frict_res_temp = calculate_execution_friction({"equity": result.equity_weight, "bond": result.bond_weight, "gold": result.gold_weight}, curr_w_temp, st.session_state.max_turnover, st.session_state.fee_rate, st.session_state.portfolio_nav)
+        clock_data_temp = calculate_hmm_market_clock(inputs, float(st.session_state.get("ma20", inputs.ma200)), float(st.session_state.get("vol_ratio", 1.0)), float(st.session_state.get("bank_breadth", 50.0)))
+
+        # TỰ ĐỘNG GHI LƯU VÀO stock_database.csv KHI BẤM NÚT
+        if save_stock_database(inputs, result, frict_res_temp, clock_data_temp, curr_w_temp, note=st.session_state.investment_notes):
+            st.toast("✅ Đã cập nhật & đồng bộ dữ liệu vào stock_database.csv!", icon="💾")
+
         if SHEETS_ON:
             try: append_log_row(make_log_row(inputs, result, st.session_state.investment_notes)); st.toast("✅ Đã lưu Google Sheets!")
             except Exception as exc: st.warning(f"⚠️ Chưa ghi log Sheets: {exc}")
@@ -896,7 +1001,12 @@ def render():
     rec = getattr(result, "recommendation", {})
     st.info(f"**⚖️ Quy tắc:** {getattr(result, 'rule_text', '')}\n\n**📢 Hành động:** `{rec.get('action', '')}` - **{rec.get('headline', '')}**\n\n**📝 Chi tiết:** {rec.get('detail', '')}")
 
-    tab1, tab2 = st.tabs(["🔍 Bảng So sánh Tỷ trọng & Chi tiết Chỉ số", "📜 Lịch sử lưu Google Sheets"])
+    tab1, tab2, tab3 = st.tabs([
+        "🔍 Bảng So sánh Tỷ trọng & Chi tiết Chỉ số",
+        "📜 Lịch sử lưu Google Sheets",
+        f"📜 Lịch sử Cơ sở Dữ liệu ({STOCK_DB_FILE})"
+    ])
+
     with tab1:
         st.markdown("**1. Bảng So sánh Tỷ trọng**")
         df_comp = pd.DataFrame([
@@ -914,9 +1024,47 @@ def render():
             {"Chỉ số": "P/E", "Giá trị": f"{inputs.pe_current:.2f}", "Pha": f"Min: {inputs.pe_min} - Max: {inputs.pe_max}", "Nhận xét": "Vùng định giá theo lợi nhuận rổ VN30."},
             {"Chỉ số": "Kỹ thuật Đa tầng", "Giá trị": f"Giá: {inputs.price_current:.1f} | MA20: {ma20_curr:.1f}", "Pha": f"MA200: {inputs.ma200:.1f}", "Nhận xét": "Cấu trúc dòng tiền."}
         ]), use_container_width=True, hide_index=True)
+
     with tab2:
         try:
             df_logs = load_log_df() if SHEETS_ON else pd.DataFrame(st.session_state.log)
             if not df_logs.empty: st.dataframe(df_logs, use_container_width=True, hide_index=True)
             else: st.info("Chưa có bản ghi lịch sử nào.")
         except Exception as exc: st.error(f"Lỗi tải logs: {exc}")
+
+    with tab3:
+        st.subheader(f"📜 Dữ liệu đã lưu trữ ({STOCK_DB_FILE})")
+        df_stock_history = load_stock_database(STOCK_DB_FILE)
+
+        if not df_stock_history.empty:
+            c_h1, c_h2, c_h3 = st.columns(3)
+            c_h1.metric("Tổng số bản ghi", len(df_stock_history))
+            c_h2.metric("Số phiên phân tích", df_stock_history["run_id"].nunique())
+            c_h3.metric("Phiên mới nhất", df_stock_history["timestamp"].iloc[-1])
+
+            col_f1, col_f2 = st.columns(2)
+            with col_f1:
+                unique_assets = ["Tất cả"] + list(df_stock_history["asset"].unique())
+                filter_asset = st.selectbox("Lọc theo lớp tài sản:", unique_assets, key="filter_stock_asset")
+            with col_f2:
+                unique_phases = ["Tất cả"] + list(df_stock_history["hmm_phase"].dropna().unique())
+                filter_phase = st.selectbox("Lọc theo pha chu kỳ HMM:", unique_phases, key="filter_stock_phase")
+
+            filtered_df = df_stock_history.copy()
+            if filter_asset != "Tất cả":
+                filtered_df = filtered_df[filtered_df["asset"] == filter_asset]
+            if filter_phase != "Tất cả":
+                filtered_df = filtered_df[filtered_df["hmm_phase"] == filter_phase]
+
+            st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+
+            csv_stock_bytes = df_stock_history.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                label=f"💾 Tải File {STOCK_DB_FILE}",
+                data=csv_stock_bytes,
+                file_name=STOCK_DB_FILE,
+                mime="text/csv",
+                use_container_width=True
+            )
+        else:
+            st.info(f"Chưa có bản ghi nào trong {STOCK_DB_FILE}. Hãy bấm '🚀 Tính toán phân bổ' hoặc kích hoạt Bot để tạo bản ghi đầu tiên.")
