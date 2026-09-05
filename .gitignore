@@ -1,17 +1,11 @@
-# Môi trường và cache Python
-__pycache__/
-*.pyc
-.venv/
-venv/
-
-# File bảo mật & dữ liệu cục bộ (TUYỆT ĐỐI KHÔNG ĐƯA LÊN GITHUB)
-.fernet_key
-secure_vault.enc
+﻿# Streamlit secrets
 .streamlit/secrets.toml
-.env
-vam_input_config.json
+secrets.toml
 
-# File test & Log rác
-bot_schedule.log
-test_tele.py
-read_vault.py
+# Key mã hóa Fernet & Vault cục bộ
+.fernet_key
+*.enc
+
+# File cơ sở dữ liệu và log cục bộ
+*.csv
+*.log
