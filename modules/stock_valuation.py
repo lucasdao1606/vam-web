@@ -15,7 +15,7 @@ Tích hợp:
 - NÂNG CẤP 11: Tự động lưu trữ và đồng bộ vào stock_database.csv
 - NÂNG CẤP 12: Bộ Scheduler độc lập (stock_scheduler) chống xung đột
 - NÂNG CẤP 13: Tự động Git Commit & Push file stock_database.csv lên GitHub
-- FIX BUG: Sửa lỗi TypeError stock_scheduler.next_run (chuyển method -> property)
+- NÂNG CẤP 14: Nút bấm xác nhận kích hoạt lịch định kỳ (Tránh tự động chạy khi chỉ mới nhập giờ)
 """
 
 import json
@@ -58,14 +58,11 @@ logging.basicConfig(
 def git_auto_commit_push(file_path: str, commit_message: str):
     def _task():
         try:
-            # 1. Thêm chỉ định duy nhất file database
             subprocess.run(["git", "add", "-f", file_path], check=True, capture_output=True, text=True)
-            # 2. Commit nếu có thay đổi mới
             res = subprocess.run(["git", "commit", "-m", commit_message], capture_output=True, text=True)
             if "nothing to commit" in res.stdout or "nothing to commit" in res.stderr:
                 logging.info(f"[GIT AUTO-SYNC] {file_path}: Không có thay đổi mới để commit.")
                 return
-            # 3. Push lên repository
             subprocess.run(["git", "push", "origin", "main"], check=True, capture_output=True, text=True)
             logging.info(f"[GIT AUTO-SYNC] {file_path}: Đã đẩy dữ liệu mới lên GitHub thành công.")
         except subprocess.CalledProcessError as e:
@@ -215,7 +212,6 @@ def save_stock_database(inputs: VAMInputs, result, frict_res: dict, clock_data: 
         else:
             df_new.to_csv(db_path, mode="a", header=False, index=False, encoding="utf-8-sig")
 
-        # TỰ ĐỘNG GIT COMMIT & PUSH LÊN GITHUB
         git_auto_commit_push(db_path, f"data(stock): Auto-record VAM analysis {ts_local}")
         return True
     except PermissionError:
@@ -565,6 +561,20 @@ def automated_job():
     else: 
         print("[TELEGRAM BOT] ❌ Gửi báo cáo cho Admin thất bại!")
 
+def init_stock_scheduler_from_vault():
+    vault = load_secure_vault()
+    mode = vault.get("schedule_mode", get_secret("SCHEDULE_MODE", "Không"))
+    run_time = vault.get("schedule_time", get_secret("SCHEDULE_TIME", "08:00"))
+    stock_scheduler.clear()
+    if mode == "Hàng ngày":
+        stock_scheduler.every().day.at(run_time).do(automated_job)
+    elif mode == "Hàng tuần":
+        stock_scheduler.every().monday.at(run_time).do(automated_job)
+    elif mode == "Hàng tháng":
+        stock_scheduler.every(30).days.at(run_time).do(automated_job)
+    if mode != "Không":
+        logging.info(f"[STOCK BOT] Đã nạp lịch trình xác nhận từ Vault: {mode} lúc {run_time}")
+
 def run_schedule_and_polling():
     last_update_id = 0
     print("[TELEGRAM BOT] Đợi hệ thống khởi tạo cấu hình...")
@@ -623,6 +633,7 @@ def run_schedule_and_polling():
 
 @st.cache_resource
 def start_background_bot():
+    init_stock_scheduler_from_vault()
     thread = threading.Thread(target=run_schedule_and_polling, daemon=True)
     add_script_run_ctx(thread)
     thread.start()
@@ -804,31 +815,8 @@ def render():
         notify_modes = ["Luôn gửi", "Chỉ gửi khi vượt ngưỡng thực thi"]
         st.session_state.telegram_notify_mode = st.selectbox("Điều kiện gửi báo cáo", notify_modes, index=notify_modes.index(st.session_state.get("telegram_notify_mode", "Luôn gửi")))
 
-        if st.button("Kiểm tra Bot Telegram", use_container_width=True):
-            test_token = st.session_state.get("telegram_token")
-            test_chat = st.session_state.get("telegram_chat_id")
-            test_chan = st.session_state.get("telegram_channel_id")
-            
-            if not test_token or not test_chat:
-                st.error("⚠️ Vui lòng nhập Token và Admin Chat ID trước!")
-            else:
-                msg_id = send_telegram_msg(test_token, test_chat, "✅ Hệ thống VAM Bot kết nối thành công! Đang test tính năng Forward...")
-                if msg_id:
-                    st.toast("Đã gửi tin nhắn cho Admin!", icon="📨")
-                    if test_chan:
-                        chan_id = test_chan if (test_chan.startswith("-") or test_chan.startswith("@")) else "@" + test_chan
-                        if forward_telegram_msg(test_token, chan_id, test_chat, msg_id):
-                            st.success(f"✅ Gửi Admin và Forward lên Channel {chan_id} thành công!")
-                            st.toast("Forward thành công!", icon="🚀")
-                        else:
-                            st.error(f"❌ Gửi Admin thành công nhưng Forward lên {chan_id} thất bại. Kiểm tra quyền Post Messages của Bot trong Channel!")
-                    else:
-                        st.success("✅ Gửi Admin thành công! (Chưa cấu hình Channel)")
-                else:
-                    st.error("❌ Gửi thất bại, kiểm tra lại Token hoặc Chat ID!")
-
-        current_schedule_config = f"{st.session_state.schedule_mode}_{st.session_state.schedule_time}"
-        if st.session_state.get("last_schedule_config") != current_schedule_config:
+        # NÚT BẤM XÁC NHẬN KÍCH HOẠT LỊCH GỬI ĐỊNH KỲ
+        if st.button("🔔 Xác nhận kích hoạt lịch gửi", use_container_width=True):
             stock_scheduler.clear()
             mode = st.session_state.schedule_mode
             run_time = st.session_state.schedule_time
@@ -837,15 +825,15 @@ def render():
             elif mode == "Hàng tuần": stock_scheduler.every().monday.at(run_time).do(automated_job)
             elif mode == "Hàng tháng": stock_scheduler.every(30).days.at(run_time).do(automated_job)
                 
-            st.session_state.last_schedule_config = current_schedule_config
-            logging.info(f"Đã cập nhật lịch trình mới: {current_schedule_config}")
+            logging.info(f"[STOCK BOT] Đã xác nhận cài đặt lịch trình mới: {mode} lúc {run_time}")
             
-            # TỰ ĐỘNG LƯU VÀO VAULT KHI THAY ĐỔI
             if CRYPTO_ENABLED:
                 current_vault = load_secure_vault()
                 current_vault["schedule_mode"] = mode
                 current_vault["schedule_time"] = run_time
                 save_secure_vault(current_vault)
+            st.toast("✅ Đã xác nhận và kích hoạt lịch gửi thành công!", icon="⏰")
+            st.rerun()
 
         next_run = getattr(stock_scheduler, "next_run", None)
         if callable(next_run):
@@ -855,7 +843,38 @@ def render():
         if next_run:
             st.caption(f"⏳ Lần chạy tiếp theo: **{next_run.strftime('%Y-%m-%d %H:%M:%S')}** (Theo giờ Server)")
         else:
-            st.caption("⏸️ Lịch chạy tự động đang tắt.")
+            st.caption("⏸️ Lịch chạy tự động đang tắt hoặc chưa xác nhận.")
+
+        c_tele1, c_tele2 = st.columns(2)
+        with c_tele1:
+            if st.button("Kiểm tra Bot Telegram", use_container_width=True):
+                test_token = st.session_state.get("telegram_token")
+                test_chat = st.session_state.get("telegram_chat_id")
+                test_chan = st.session_state.get("telegram_channel_id")
+                
+                if not test_token or not test_chat:
+                    st.error("⚠️ Vui lòng nhập Token và Admin Chat ID trước!")
+                else:
+                    msg_id = send_telegram_msg(test_token, test_chat, "✅ Hệ thống VAM Bot kết nối thành công! Đang test tính năng Forward...")
+                    if msg_id:
+                        st.toast("Đã gửi tin nhắn cho Admin!", icon="📨")
+                        if test_chan:
+                            chan_id = test_chan if (test_chan.startswith("-") or test_chan.startswith("@")) else "@" + test_chan
+                            if forward_telegram_msg(test_token, chan_id, test_chat, msg_id):
+                                st.success(f"✅ Gửi Admin và Forward lên Channel {chan_id} thành công!")
+                                st.toast("Forward thành công!", icon="🚀")
+                            else:
+                                st.error(f"❌ Gửi Admin thành công nhưng Forward lên {chan_id} thất bại. Kiểm tra quyền Channel!")
+                        else:
+                            st.success("✅ Gửi Admin thành công! (Chưa cấu hình Channel)")
+                    else:
+                        st.error("❌ Gửi thất bại, kiểm tra lại Token hoặc Chat ID!")
+
+        with c_tele2:
+            if st.button("Gửi báo cáo ngay", use_container_width=True):
+                with st.spinner("Đang chạy phân tích & gửi báo cáo..."):
+                    automated_job()
+                    st.toast("Đã gửi báo cáo VAM ngay!", icon="🚀")
 
     with st.sidebar.expander("🚀 vnstock (Chứng khoán & Thanh khoản)", expanded=True):
         if st.button("🚀 Lấy dữ liệu từ vnstock", use_container_width=True):

@@ -6,7 +6,10 @@ Tích hợp:
 - Lập lịch tự động gửi báo cáo Telegram & Forward Channel
 - Tự động đồng bộ và lưu trữ toàn bộ tham số vào crypto_database.csv
 - Bộ Scheduler độc lập (crypto_scheduler) chống xung đột
-- NÂNG CẤP MỚI: Tự động Git Commit & Push file crypto_database.csv lên GitHub
+- Tự động Git Commit & Push file crypto_database.csv lên GitHub
+- Nút bấm xác nhận kích hoạt lịch Crypto (Tránh tự động chạy khi mới nhập giờ)
+- Thẻ hiển thị chi tiết lịch hẹn và thời gian gửi kế tiếp sau khi xác nhận
+- Điều chỉnh luồng UI: Chỉ chạy phân tích khi bấm nút ở Sidebar, không tự động quét khi mới tải trang
 - Tab tra cứu, lọc lịch sử và nút Download file CSV tiện lợi
 """
 
@@ -145,7 +148,6 @@ def automated_crypto_job():
 
     try:
         data = run_vam_analysis(log_func=logging.info, auto_save=True)
-        # Kích hoạt tự động đẩy file crypto_database.csv lên GitHub
         git_auto_commit_push(CRYPTO_DB_FILE, f"data(crypto): Auto-record Crypto VAM metrics {data.get('timestamp_local')}")
 
         curr_port = {
@@ -165,6 +167,20 @@ def automated_crypto_job():
     except Exception as e:
         logging.error(f"[CRYPTO BOT] Lỗi chạy tự động Crypto VAM: {e}")
 
+def init_crypto_scheduler_from_vault():
+    vault = load_secure_vault()
+    m = vault.get("crypto_schedule_mode", "Không")
+    t = vault.get("crypto_schedule_time", "08:30")
+    crypto_scheduler.clear()
+    if m == "Hàng ngày":
+        crypto_scheduler.every().day.at(t).do(automated_crypto_job)
+    elif m == "Hàng tuần":
+        crypto_scheduler.every().monday.at(t).do(automated_crypto_job)
+    elif m == "Hàng tháng":
+        crypto_scheduler.every(30).days.at(t).do(automated_crypto_job)
+    if m != "Không":
+        logging.info(f"[CRYPTO BOT] Đã nạp lịch trình xác nhận từ Vault: {m} lúc {t}")
+
 def run_crypto_scheduler():
     while True:
         try:
@@ -175,6 +191,7 @@ def run_crypto_scheduler():
 
 @st.cache_resource
 def start_crypto_background_worker():
+    init_crypto_scheduler_from_vault()
     thread = threading.Thread(target=run_crypto_scheduler, daemon=True)
     add_script_run_ctx(thread)
     thread.start()
@@ -210,7 +227,8 @@ def render():
         "crypto_curr_w_paxg": 10.0,
         "crypto_curr_w_usdt": 40.0,
         "crypto_schedule_mode": vault_data.get("crypto_schedule_mode", "Không"),
-        "crypto_schedule_time": vault_data.get("crypto_schedule_time", "08:30")
+        "crypto_schedule_time": vault_data.get("crypto_schedule_time", "08:30"),
+        "crypto_investment_notes": ""
     }
     for k, v in common_keys.items():
         if k not in st.session_state:
@@ -281,8 +299,8 @@ def render():
             value=st.session_state.crypto_schedule_time
         )
 
-        cfg_key = f"crypto_{st.session_state.crypto_schedule_mode}_{st.session_state.crypto_schedule_time}"
-        if st.session_state.get("last_crypto_schedule_cfg") != cfg_key:
+        # NÚT BẤM XÁC NHẬN KÍCH HOẠT LỊCH CRYPTO
+        if st.button("🔔 Xác nhận kích hoạt lịch Crypto", use_container_width=True):
             crypto_scheduler.clear()
             m = st.session_state.crypto_schedule_mode
             t = st.session_state.crypto_schedule_time
@@ -292,14 +310,41 @@ def render():
                 crypto_scheduler.every().monday.at(t).do(automated_crypto_job)
             elif m == "Hàng tháng":
                 crypto_scheduler.every(30).days.at(t).do(automated_crypto_job)
-            st.session_state.last_crypto_schedule_cfg = cfg_key
 
-            # TỰ ĐỘNG LƯU VÀO VAULT KHI THAY ĐỔI LỊCH CRYPTO
             if CRYPTO_ENABLED:
                 current_vault = load_secure_vault()
                 current_vault["crypto_schedule_mode"] = m
                 current_vault["crypto_schedule_time"] = t
                 save_secure_vault(current_vault)
+            logging.info(f"[CRYPTO BOT] Đã xác nhận và kích hoạt lịch trình mới: {m} lúc {t}")
+            st.toast(f"✅ Đã xác nhận lịch gửi: {m} lúc {t}!", icon="⏰")
+            st.rerun()
+
+        # HIỂN THỊ THÔNG TIN LỊCH HẸN CHI TIẾT SAU KHI XÁC NHẬN
+        confirmed_mode = vault_data.get("crypto_schedule_mode", "Không")
+        confirmed_time = vault_data.get("crypto_schedule_time", "08:30")
+
+        next_run_crypto = getattr(crypto_scheduler, "next_run", None)
+        if callable(next_run_crypto):
+            try: next_run_crypto = next_run_crypto()
+            except Exception: next_run_crypto = None
+
+        if confirmed_mode != "Không" and next_run_crypto:
+            st.success(
+                f"✅ **Lịch hẹn đang hoạt động:**\n\n"
+                f"- **Chu kỳ:** {confirmed_mode}\n"
+                f"- **Khung giờ gửi:** {confirmed_time}\n"
+                f"- **Dự kiến gửi tiếp theo:** `{next_run_crypto.strftime('%Y-%m-%d %H:%M:%S')}` *(Giờ Server)*"
+            )
+        elif confirmed_mode != "Không":
+            st.info(f"⏳ **Lịch đã lưu:** {confirmed_mode} lúc {confirmed_time} (Đang chờ nạp phiên chạy)")
+        else:
+            st.caption("⏸️ Lịch chạy tự động đang tắt hoặc chưa xác nhận.")
+
+        # Cảnh báo khi thay đổi giá trị nhưng chưa bấm nút Xác nhận
+        if (st.session_state.crypto_schedule_mode != confirmed_mode or 
+            st.session_state.crypto_schedule_time != confirmed_time):
+            st.warning("⚠️ Cấu hình vừa chỉnh sửa chưa lưu. Vui lòng bấm '🔔 Xác nhận kích hoạt lịch Crypto' để áp dụng!")
 
         c_btn1, c_btn2 = st.columns(2)
         with c_btn1:
@@ -325,25 +370,42 @@ def render():
         st.number_input("PAXG Vàng (%)", 0.0, 100.0, step=1.0, key="crypto_curr_w_paxg")
         st.number_input("USDT Tiền mặt (%)", 0.0, 100.0, step=1.0, key="crypto_curr_w_usdt")
 
+    st.sidebar.markdown("---")
+    st.session_state.crypto_investment_notes = st.sidebar.text_area(
+        "📝 Ghi chú phân tích Crypto",
+        value=st.session_state.get("crypto_investment_notes", "")
+    )
+
+    # NÚT BẤM CHẠY PHÂN TÍCH NẰM TƯƠNG TỰ BÊN STOCK MODULE
+    calc_btn = st.sidebar.button("🚀 Chạy phân tích Crypto VAM Realtime", use_container_width=True, type="primary")
+
     # ---------------------------------------------------------------------------
     # MAIN DASHBOARD
     # ---------------------------------------------------------------------------
     st.title("⚡ Crypto VAM Multi-Asset Valuation & Dynamic Allocation")
     st.markdown("Hệ thống định lượng đa tầng: On-chain VWAP MVRV, Price Deviation, Taker Flow, Funding Rate & Rebalance Safeguard.")
 
-    calc_btn = st.button("🚀 Chạy phân tích Crypto VAM Realtime", type="primary")
-
-    if calc_btn or "last_crypto_data" not in st.session_state:
+    # CHỈ CHẠY PHÂN TÍCH THỦ CÔNG KHI NGƯỜI DÙNG BẤM NÚT
+    if calc_btn:
         with st.spinner("Đang quét On-chain RPC Pool, Binance Spot/Futures và CoinGecko Market Cap..."):
             try:
                 st.session_state.last_crypto_data = run_vam_analysis(log_func=st.write, auto_save=True)
-                git_auto_commit_push(CRYPTO_DB_FILE, f"data(crypto): Manual analysis sync {st.session_state.last_crypto_data.get('timestamp_local')}")
+                git_auto_commit_push(
+                    CRYPTO_DB_FILE,
+                    f"data(crypto): Manual analysis sync {st.session_state.last_crypto_data.get('timestamp_local')}"
+                )
                 st.toast("✅ Đã cập nhật & đồng bộ dữ liệu vào crypto_database.csv!", icon="💾")
             except Exception as e:
                 st.error(f"Lỗi phân tích: {e}")
                 return
 
-    data = st.session_state.last_crypto_data
+    data = st.session_state.get("last_crypto_data")
+
+    # NẾU CHƯA BẤM CHẠY THÌ CHỈ HIỂN THỊ HƯỚNG DẪN, KHÔNG TỰ QUÉT
+    if not data:
+        st.info("👈 Bấm '🚀 Chạy phân tích Crypto VAM Realtime' ở thanh bên trái để bắt đầu quét dữ liệu.")
+        return
+
     vam_market = data["vam_market_final"]
 
     if vam_market < 35.0:
