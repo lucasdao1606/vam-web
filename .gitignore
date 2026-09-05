@@ -1,20 +1,17 @@
-# Môi trường ảo Python
-venv/
-.venv/
-env/
+# Môi trường và cache Python
 __pycache__/
 *.pyc
+.venv/
+venv/
 
-# Khóa API, Secrets và Credentials (RẤT QUAN TRỌNG)
-*.env
-*.json
-service_account.json
-gemini_key.json
+# File bảo mật & dữ liệu cục bộ (TUYỆT ĐỐI KHÔNG ĐƯA LÊN GITHUB)
+.fernet_key
+secure_vault.enc
+.streamlit/secrets.toml
+.env
 vam_input_config.json
 
-# File log, cache hệ thống
-*.log
-.streamlit/secrets.toml
-mre_vam_output/
-.DS_Store
-Thumbs.db
+# File test & Log rác
+bot_schedule.log
+test_tele.py
+read_vault.py

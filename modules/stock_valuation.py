@@ -2,10 +2,17 @@
 modules/stock_valuation.py - VAM Portfolio Allocator & HMM Market Clock
 Tích hợp:
 - Dữ liệu cơ bản, kỹ thuật và Volatility chuẩn hóa từ vnstock
-- Tham số vĩ mô độc lập từ Gemini AI (Hỗ trợ gemini-3.1-pro-preview & Dynamic Model Fallback)
-- NÂNG CẤP 1: Đồng hồ chu kỳ lượng hóa bằng xác suất chuyển pha mềm HMM (Soft Probabilities)
-- NÂNG CẤP 2: Bộ lọc Điều kiện Tài chính & Thanh khoản Nội địa (VN-FCI) trích xuất từ vnstock
-- NÂNG CẤP 3: Thuật toán Kiểm soát Ma sát Thực thi (Turnover Cap, Deadband & Execution Cost)
+- Tham số vĩ mô độc lập từ Gemini AI
+- NÂNG CẤP 1 & 2: Đồng hồ chu kỳ HMM & Thanh khoản VN-FCI
+- NÂNG CẤP 3: Thuật toán Kiểm soát Ma sát Thực thi
+- NÂNG CẤP 4: Tự động hóa cập nhật API & Báo cáo Telegram
+- NÂNG CẤP 5: Bảo mật đa tầng (Secrets, Env, AES-128)
+- NÂNG CẤP 6: Hệ thống Ghi Log File
+- NÂNG CẤP 7: Đồng bộ UI & Decoupling Logic
+- NÂNG CẤP 8: Bảo mật Write-Only cho các trường API
+- NÂNG CẤP 9: Báo cáo Telegram đầy đủ và chi tiết như giao diện UI
+- NÂNG CẤP 10: Tự động Forward tin nhắn từ Admin lên Public Channel
+- HOTFIX 3: Đồng bộ logic Forward chủ động cho hàm Lập lịch tự động (Automated Job)
 """
 
 import json
@@ -14,45 +21,505 @@ import time
 import os
 import math
 from datetime import datetime, date, timedelta
+import threading
+import schedule
+import requests
+import logging
 
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 from vam_core import VAMInputs, compute
 from sheets_log import sheets_configured, append_log_row, load_log_df, make_log_row
 
+# Khởi tạo File Logging cho quá trình chạy ngầm
+logging.basicConfig(
+    filename='bot_schedule.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    encoding='utf-8'
+)
 
+# ---------------------------------------------------------------------------
+# CƠ CHẾ BẢO MẬT & MÃ HÓA (SECURITY VAULT)
+# ---------------------------------------------------------------------------
+try:
+    from cryptography.fernet import Fernet
+    CRYPTO_ENABLED = True
+except ImportError:
+    CRYPTO_ENABLED = False
+
+def get_secret(key_name, default=""):
+    val = os.getenv(key_name)
+    if not val:
+        try:
+            val = st.secrets.get(key_name, default)
+        except Exception:
+            val = default
+    return val
+
+def get_or_create_fernet_key():
+    if not CRYPTO_ENABLED: return None
+    key = get_secret("APP_ENCRYPTION_KEY")
+    key_file = ".fernet_key"
+    if not key:
+        if os.path.exists(key_file):
+            with open(key_file, "rb") as f: key = f.read().decode()
+        else:
+            key = Fernet.generate_key().decode()
+            try:
+                with open(key_file, "wb") as f: f.write(key.encode())
+            except Exception: pass
+    return key.encode()
+
+FERNET_KEY = get_or_create_fernet_key()
+CIPHER_SUITE = Fernet(FERNET_KEY) if FERNET_KEY else None
+
+def save_secure_vault(data: dict) -> bool:
+    if not CIPHER_SUITE: return False
+    try:
+        json_str = json.dumps(data)
+        encrypted_data = CIPHER_SUITE.encrypt(json_str.encode())
+        with open("secure_vault.enc", "wb") as f: f.write(encrypted_data)
+        return True
+    except Exception as e:
+        logging.error(f"Lỗi mã hóa: {e}")
+        return False
+
+def load_secure_vault() -> dict:
+    if not CIPHER_SUITE or not os.path.exists("secure_vault.enc"): return {}
+    try:
+        with open("secure_vault.enc", "rb") as f: encrypted_data = f.read()
+        decrypted_data = CIPHER_SUITE.decrypt(encrypted_data).decode()
+        return json.loads(decrypted_data)
+    except Exception as e:
+        logging.error(f"Lỗi giải mã: {e}")
+        return {}
+
+SENSITIVE_KEYS = {"gemini_api_key", "telegram_token", "telegram_chat_id", "telegram_channel_id"}
+GLOBAL_CONFIG = {}
+
+# ---------------------------------------------------------------------------
+# API LIÊN KẾT BÊN NGOÀI
+# ---------------------------------------------------------------------------
+def send_telegram_msg(token, chat_id, message):
+    if not token or not chat_id: return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("ok"):
+            return data.get("result", {}).get("message_id", True)
+        return True
+    except Exception as e:
+        logging.error(f"Lỗi gửi Telegram: {e}")
+        return False
+
+def forward_telegram_msg(token, target_chat_id, from_chat_id, message_id):
+    if not token or not target_chat_id: return False
+    url = f"https://api.telegram.org/bot{token}/forwardMessage"
+    payload = {"chat_id": target_chat_id, "from_chat_id": from_chat_id, "message_id": message_id}
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        return res.json().get("ok", False)
+    except Exception as e:
+        logging.error(f"Lỗi forward Telegram: {e}")
+        print(f"[TELEGRAM BOT] Lỗi API forward: {e}")
+        return False
+
+# ---------------------------------------------------------------------------
+# LOGIC TÍNH TOÁN CORE (Tách biệt hoàn toàn khỏi UI)
+# ---------------------------------------------------------------------------
+def calculate_hmm_market_clock(inputs: VAMInputs, ma20_val: float, vol_ratio: float, bank_breadth: float) -> dict:
+    pe_norm = (inputs.pe_current - inputs.pe_min) / max(0.01, (inputs.pe_max - inputs.pe_min))
+    pb_norm = (inputs.pb_current - inputs.pb_min) / max(0.01, (inputs.pb_max - inputs.pb_min))
+    val_score = float(np.clip((pe_norm + pb_norm) / 2.0, 0.0, 1.0))
+    p, ma200 = inputs.price_current, inputs.ma200
+    trend_long = (p - ma200) / max(1.0, ma200)
+    trend_short = (p - ma20_val) / max(1.0, ma20_val)
+    trend_score = float(np.clip((trend_long * 0.7 + trend_short * 0.3) * 5.0, -1.5, 1.5))
+    vol_r = inputs.volatility_current / max(0.1, inputs.volatility_avg)
+    dd_norm = float(np.clip(inputs.drawdown_pct / 30.0, 0.0, 1.5))
+    stress_score = float(np.clip((vol_r - 1.0) + dd_norm, -1.0, 2.0))
+    vr = float(vol_ratio)
+    bb = float(bank_breadth) / 100.0
+    fci_score = float(np.clip((vr - 1.0) * 1.5 + (bb - 0.5) * 2.0, -1.5, 1.5))
+
+    logit_rec = (1.0 - val_score) * 2.5 + stress_score * 0.8 - max(0.0, trend_score) * 1.0 + fci_score * 0.5
+    logit_exp = trend_score * 2.2 + (0.5 - abs(val_score - 0.5)) * 1.2 - stress_score * 1.0 + fci_score * 1.5
+    logit_slo = val_score * 2.5 - trend_short * 1.2 + (vol_r - 1.0) * 1.0 - fci_score * 0.8
+    logit_con = -trend_score * 2.0 + stress_score * 1.5 + (val_score * 0.5) - fci_score * 1.2
+
+    logits = np.array([logit_rec, logit_exp, logit_slo, logit_con], dtype=float)
+    probs = np.exp(logits - np.max(logits)) / np.sum(np.exp(logits - np.max(logits)))
+    p_recovery, p_expansion, p_slowdown, p_recession = probs[0], probs[1], probs[2], probs[3]
+
+    centers_rad = np.radians(np.array([180.0, 285.0, 352.5, 90.0]))
+    exp_angle_deg = math.degrees(math.atan2(float(np.sum(probs * np.sin(centers_rad))), float(np.sum(probs * np.cos(centers_rad))))) % 360.0
+    clock_hour = round(float(exp_angle_deg / 30.0), 1)
+    if clock_hour == 0.0: clock_hour = 12.0
+    h_int, m_int = int(math.floor(clock_hour)), int((clock_hour - int(math.floor(clock_hour))) * 60)
+    time_str = f"{h_int:02d}:{m_int:02d}"
+
+    regimes_map = [
+        ("RECOVERY", "TÍCH LŨY (6H)", p_recovery, "Định giá rẻ, gom tài sản.", "Ưu tiên Cổ phiếu"),
+        ("EXPANSION", "TĂNG TRƯỞNG (9H)", p_expansion, "Đồng thuận vĩ mô, tăng trưởng.", "Buy & Hold"),
+        ("SLOWDOWN", "PHÂN PHỐI (12H)", p_slowdown, "Quá nhiệt, định giá cao.", "Nâng phòng thủ"),
+        ("RECESSION", "SUY THOÁI (3H)", p_recession, "Gãy xu hướng, áp lực bán.", "Bảo toàn vốn")
+    ]
+    dominant = max(regimes_map, key=lambda x: x[2])
+    if fci_score >= 0.4: fci_state, fci_color = "Dồi Dào", "#4ADE80"
+    elif fci_score <= -0.4: fci_state, fci_color = "Thắt Chặt", "#F87171"
+    else: fci_state, fci_color = "Trung Tính", "#FACC15"
+
+    return {"hour": clock_hour, "time_str": time_str, "phase": dominant[1], "desc": dominant[3], "bias": dominant[4], "fci_score": fci_score, "fci_state": fci_state, "fci_color": fci_color, "probabilities": {"Recovery": p_recovery, "Expansion": p_expansion, "Slowdown": p_slowdown, "Recession": p_recession}}
+
+def calculate_execution_friction(raw_weights, curr_weights, max_turnover_pct, fee_rate_pct, portfolio_nav_mil, deadband_pct=3.0):
+    keys = ["equity", "bond", "gold"]
+    w_prev = np.array([curr_weights[k] for k in keys], dtype=float)
+    w_desired = np.array([raw_weights[k] for k in keys], dtype=float)
+    raw_diff = w_desired - w_prev
+    turnover_raw = float(np.sum(np.abs(raw_diff)) / 2.0)
+
+    if turnover_raw < deadband_pct:
+        w_exec, status, action_needed, turnover_actual = w_prev.copy(), "Độ lệch trong vùng dung sai < 3%", False, 0.0
+    else:
+        action_needed = True
+        if turnover_raw > max_turnover_pct:
+            w_exec = w_prev + (max_turnover_pct / turnover_raw) * raw_diff
+            status, turnover_actual = f"Cắt trần ở {max_turnover_pct:.1f}%", max_turnover_pct
+        else:
+            w_exec, status, turnover_actual = w_desired.copy(), "Thực thi toàn phần", turnover_raw
+
+    w_exec = (w_exec / np.sum(w_exec)) * 100.0
+    exec_weights = {keys[i]: round(float(w_exec[i]), 1) for i in range(len(keys))}
+    return {"exec_weights": exec_weights, "raw_turnover": turnover_raw, "actual_turnover": turnover_actual, "money_turnover": (turnover_actual / 100.0) * portfolio_nav_mil, "est_fee_cost": ((turnover_actual / 100.0) * portfolio_nav_mil) * (fee_rate_pct / 100.0), "status": status, "action_needed": action_needed}
+
+def fetch_vnstock_market_data(progress_bar=None, status_box=None, log_func=print) -> dict:
+    try: 
+        from vnstock import Reference, Fundamental, Quote
+    except ImportError:
+        log_func("⚠️ Cần cài thư viện vnstock!")
+        return {}
+    results = {}
+    if status_box: status_box.update(label="📈 Tải dữ liệu VNINDEX...", state="running")
+    if progress_bar: progress_bar.progress(5)
+    try:
+        end_d = date.today()
+        start_d = end_d - timedelta(days=730)
+        df_idx = Quote(symbol="VNINDEX", source="VCI").history(start=start_d.isoformat(), end=end_d.isoformat(), interval="1D")
+        if df_idx is not None and not df_idx.empty:
+            cot_close = "close" if "close" in df_idx.columns else df_idx.columns[-2]
+            close_prices = df_idx[cot_close].dropna()
+            if close_prices.iloc[-1] < 200: close_prices = close_prices * 1000
+            p_curr = float(close_prices.iloc[-1])
+            ma20_val = float(close_prices.iloc[-20:].mean()) if len(close_prices) >= 20 else float(close_prices.mean())
+            ma200_val = float(close_prices.iloc[-200:].mean()) if len(close_prices) >= 200 else float(close_prices.mean())
+            returns = close_prices.pct_change().dropna()
+            vol_curr = float(returns.iloc[-252:].std() * np.sqrt(252) * 100) if len(returns) >= 252 else float(returns.std() * np.sqrt(252) * 100)
+            vol_avg = float(returns.std() * np.sqrt(252) * 100)
+            peak = close_prices.iloc[-252:].cummax() if len(close_prices) >= 252 else close_prices.cummax()
+            drawdown_val = float(abs(((close_prices.iloc[-252:] - peak) / peak).min()) * 100)
+
+            cot_vol = next((c for c in ["volume", "total_volume", "vol"] if c in df_idx.columns), None)
+            if cot_vol:
+                v_series = df_idx[cot_vol].dropna()
+                v_ma20 = float(v_series.iloc[-20:].mean()) if len(v_series) >= 20 else 1.0
+                v_ma200 = float(v_series.iloc[-200:].mean()) if len(v_series) >= 200 else 1.0
+                results["vol_ratio"] = round(float(v_ma20 / max(1.0, v_ma200)), 2)
+            else: results["vol_ratio"] = 1.0
+
+            results.update({"price_current": round(p_curr, 1), "ma20": round(ma20_val, 1), "ma200": round(ma200_val, 1), "volatility_current": round(vol_curr, 1), "volatility_avg": round(vol_avg, 1), "drawdown_pct": round(drawdown_val, 1)})
+    except Exception as e: 
+        log_func(f"Lỗi tải VNINDEX: {e}")
+
+    if status_box: status_box.update(label="📋 Lấy danh sách VN30...", state="running")
+    if progress_bar: progress_bar.progress(10)
+    try:
+        ref = Reference()
+        ket_qua_ref = ref.index.members(symbol="VN30")
+        cot_symbol = next((c for c in ["symbol", "ticker", "stock_code", "code"] if c in ket_qua_ref.columns), ket_qua_ref.columns[0]) if isinstance(ket_qua_ref, pd.DataFrame) else None
+        danh_sach_ma = ket_qua_ref[cot_symbol].tolist() if cot_symbol else list(ket_qua_ref)
+    except Exception: return results
+
+    tong_ma, fa, list_pe, list_pb, list_roe = len(danh_sach_ma), Fundamental(), [], [], []
+    bank_tickers = {"VCB", "BID", "CTG", "TCB", "MBB", "ACB", "VPB", "HDB", "STB"}
+    bank_above_ma50_count, bank_total_detected = 0, 0
+
+    if status_box: status_box.update(label=f"🔄 Phân tích {tong_ma} mã VN30 (Chờ 10s/mã)...", state="running")
+    for idx, ma in enumerate(danh_sach_ma, start=1):
+        if progress_bar: progress_bar.progress(int(10 + (idx / tong_ma) * 85))
+        if status_box: status_box.write(f"⏳ [{idx}/{tong_ma}] Phân tích mã **{ma}**...")
+        try:
+            df_ratio = fa.equity(ma).ratio(period="quarter")
+            if df_ratio is not None and not df_ratio.empty:
+                cols_ky = [c for c in df_ratio.columns if re.match(r"\d{4}-Q\d", str(c))]
+                if cols_ky:
+                    cols_ky.sort(key=lambda x: (int(x.split("-")[0]), int(x.split("-")[1].replace("Q", ""))), reverse=True)
+                    cot_gan = cols_ky[0]
+                    r_eps = df_ratio[df_ratio.get("item_id", pd.Series()) == "trailing_eps"]
+                    r_roe = df_ratio[df_ratio.get("item_id", pd.Series()) == "roe_trailling"]
+                    r_bvps = df_ratio[df_ratio.get("item_id", pd.Series()) == "book_value_per_share_bvps"]
+
+                    eps_val = float(r_eps[cot_gan].values[0]) if not r_eps.empty else None
+                    roe_val = float(r_roe[cot_gan].values[0]) if not r_roe.empty else None
+                    bvps_val = float(r_bvps[cot_gan].values[0]) if not r_bvps.empty else None
+
+                    df_q = Quote(symbol=ma, source="VCI").history(start=(date.today()-timedelta(weeks=12)).isoformat(), end=date.today().isoformat(), interval="1D")
+                    if df_q is not None and not df_q.empty:
+                        cot_g = "close" if "close" in df_q.columns else df_q.columns[-2]
+                        gia_dong = float(df_q.iloc[-1][cot_g])
+                        if gia_dong < 2000: gia_dong *= 1000
+
+                        if eps_val and eps_val > 0:
+                            pe_calc = gia_dong / eps_val
+                            if 1.0 <= pe_calc <= 70.0: list_pe.append(pe_calc)
+                        if bvps_val and bvps_val > 0:
+                            pb_calc = gia_dong / bvps_val
+                            if 0.2 <= pb_calc <= 15.0: list_pb.append(pb_calc)
+                        if roe_val is not None:
+                            roe_norm = roe_val * 100.0 if abs(roe_val) <= 1.0 else roe_val
+                            if -50.0 <= roe_norm <= 100.0: list_roe.append(roe_norm)
+
+                        if ma in bank_tickers:
+                            bank_total_detected += 1
+                            c_series = df_q[cot_g].dropna()
+                            ma50 = float(c_series.iloc[-50:].mean()) if len(c_series) >= 50 else float(c_series.mean())
+                            if gia_dong >= ma50: bank_above_ma50_count += 1
+        except Exception: pass
+        time.sleep(10.0)
+
+    if list_pe: results["pe_current"] = round(float(np.median(list_pe)), 2)
+    if list_pb: results["pb_current"] = round(float(np.median(list_pb)), 2)
+    if list_roe: results["roe_current"] = round(float(np.median(list_roe)), 2)
+    results["bank_breadth"] = round(float((bank_above_ma50_count / bank_total_detected) * 100.0), 1) if bank_total_detected > 0 else 50.0
+
+    if progress_bar: progress_bar.progress(100)
+    if status_box: status_box.update(label="✅ Hoàn tất lấy dữ liệu từ vnstock!", state="complete", expanded=False)
+    return results
+
+def fetch_missing_params_via_gemini(api_key: str, log_func=print) -> dict:
+    MISSING_PARAMS_KEYS = ["rf", "us10y", "us_cpi", "eps_growth_exp"]
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError: 
+        log_func("⚠️ Chưa cài đặt google-genai")
+        return {"error": "Chưa cài đặt google-genai"}
+    client = genai.Client(api_key=api_key.strip())
+    prompt = "Trích xuất JSON 4 chỉ số (float): rf, us10y, us_cpi, eps_growth_exp mới nhất."
+    for model_name in ["gemini-3.1-pro-preview", "gemini-2.5-flash"]:
+        try:
+            response = client.models.generate_content(model=model_name, contents=prompt, config=types.GenerateContentConfig(temperature=0.1, tools=[{"google_search": {}}]))
+            match = re.search(r"\{[\s\S]*?\}", response.text or "")
+            if match:
+                data = json.loads(match.group(0))
+                return {k: float(data[k]) for k in MISSING_PARAMS_KEYS if k in data}
+        except Exception: continue
+    return {"error": "Lỗi API"}
+
+# ---------------------------------------------------------------------------
+# TIẾN TRÌNH BACKGROUND (LẬP LỊCH & LẮNG NGHE ĐỘC LẬP)
+# ---------------------------------------------------------------------------
+def automated_job():
+    print("[TELEGRAM BOT] Bắt đầu kích hoạt tiến trình báo cáo VAM tự động...")
+    logging.info("Bắt đầu kích hoạt tiến trình báo cáo VAM tự động...")
+    token = GLOBAL_CONFIG.get("telegram_token")
+    chat_id = GLOBAL_CONFIG.get("telegram_chat_id")
+    api_key = GLOBAL_CONFIG.get("gemini_api_key")
+    notify_mode = GLOBAL_CONFIG.get("telegram_notify_mode", "Luôn gửi")
+    
+    if not token or not chat_id:
+        print("[TELEGRAM BOT] ⚠️ Thiếu Token hoặc Chat ID, hủy tác vụ.")
+        return
+
+    class DummyBox:
+        def update(self, *args, **kwargs): pass
+        def write(self, *args, **kwargs): pass
+    class DummyBar:
+        def progress(self, *args, **kwargs): pass
+        
+    print("[TELEGRAM BOT] Đang lấy dữ liệu từ vnstock (mất khoảng 5 phút)...")
+    vn_data = fetch_vnstock_market_data(DummyBar(), DummyBox(), log_func=logging.warning)
+    job_config = GLOBAL_CONFIG.copy()
+    job_config.update(vn_data)
+    
+    if api_key:
+        print("[TELEGRAM BOT] Đang lấy dữ liệu vĩ mô từ Gemini...")
+        missing_data = fetch_missing_params_via_gemini(api_key, log_func=logging.warning)
+        if missing_data and isinstance(missing_data, dict) and "error" not in missing_data:
+            for k, v in missing_data.items():
+                if v is not None: job_config[k] = v
+
+    saa_equity = max(0.0, float(100 - job_config.get("age", 40)))
+    saa_bond = max(0.0, 100.0 - saa_equity - 10.0)
+    inputs = VAMInputs(
+        age=int(job_config.get("age", 40)), saa_equity=saa_equity, saa_gold=10.0, saa_bond=saa_bond,
+        pe_current=float(job_config.get("pe_current", 14.2)), pe_min=float(job_config.get("pe_min", 10.0)), pe_max=float(job_config.get("pe_max", 20.0)),
+        pb_current=float(job_config.get("pb_current", 1.72)), pb_min=float(job_config.get("pb_min", 1.35)), pb_max=float(job_config.get("pb_max", 2.6)),
+        rf=float(job_config.get("rf", 2.75)), erp_min=float(job_config.get("erp_min", 1.5)), erp_max=float(job_config.get("erp_max", 7.0)),
+        dy_current=float(job_config.get("dy_current", 1.7)), dy_min=float(job_config.get("dy_min", 1.2)), dy_max=float(job_config.get("dy_max", 3.2)),
+        w_pe=float(job_config.get("w_pe", 30.0)), w_pb=float(job_config.get("w_pb", 20.0)), w_erp=float(job_config.get("w_erp", 35.0)), w_dy=float(job_config.get("w_dy", 15.0)),
+        roe_current=float(job_config.get("roe_current", 13.5)), roe_benchmark=float(job_config.get("roe_benchmark", 12.0)),
+        eps_growth_exp=float(job_config.get("eps_growth_exp", 10.0)), eps_growth_benchmark=float(job_config.get("eps_growth_benchmark", 8.0)),
+        price_current=float(job_config.get("price_current", 1250.5)), ma200=float(job_config.get("ma200", 1265.2)),
+        volatility_current=float(job_config.get("volatility_current", 16.2)), volatility_avg=float(job_config.get("volatility_avg", 17.5)),
+        drawdown_pct=float(job_config.get("drawdown_pct", 4.2)), us10y=float(job_config.get("us10y", 4.25)), us_cpi=float(job_config.get("us_cpi", 2.9)),
+        method=job_config.get("method", "step"),
+    )
+    result = compute(inputs)
+    
+    raw_w = {"equity": result.equity_weight, "bond": result.bond_weight, "gold": result.gold_weight}
+    curr_w = {"equity": float(job_config.get("curr_w_equity", 60.0)), "bond": float(job_config.get("curr_w_bond", 25.0)), "gold": float(job_config.get("curr_w_gold", 15.0))}
+    curr_sum = sum(curr_w.values())
+    if curr_sum > 0: curr_w = {k: (v / curr_sum) * 100.0 for k, v in curr_w.items()}
+
+    frict_res = calculate_execution_friction(raw_weights=raw_w, curr_weights=curr_w, max_turnover_pct=float(job_config.get("max_turnover", 25.0)), fee_rate_pct=float(job_config.get("fee_rate", 0.15)), portfolio_nav_mil=float(job_config.get("portfolio_nav", 1000.0)))
+
+    if notify_mode == "Chỉ gửi khi vượt ngưỡng thực thi" and not frict_res["action_needed"]:
+        print("[TELEGRAM BOT] Bỏ qua gửi báo cáo do tỷ trọng chưa vượt ngưỡng thực thi.")
+        return
+
+    ma20_curr = float(job_config.get("ma20", inputs.ma200))
+    vol_r = float(job_config.get("vol_ratio", 1.0))
+    bank_b = float(job_config.get("bank_breadth", 50.0))
+    clock_data = calculate_hmm_market_clock(inputs, ma20_curr, vol_r, bank_b)
+    
+    exec_w = frict_res["exec_weights"]
+    rec = getattr(result, "recommendation", {})
+
+    msg = f"📊 <b>BÁO CÁO VAM TỰ ĐỘNG</b>\n\n"
+    msg += f"🕰️ <b>ĐỒNG HỒ CHU KỲ & THANH KHOẢN</b>\n"
+    msg += f"- <b>Pha thị trường:</b> {clock_data['phase']} ({clock_data['time_str']})\n"
+    msg += f"- <b>Thanh khoản VN-FCI:</b> {clock_data['fci_state']} (Score: {clock_data['fci_score']:+.2f})\n"
+    msg += f"- <b>Trạng thái:</b> {clock_data['desc']}\n"
+    msg += f"- <b>Chiến lược:</b> {clock_data['bias']}\n\n"
+    
+    msg += f"🔹 <b>ĐỊNH GIÁ & TỶ TRỌNG LÝ THUYẾT (VAM)</b>\n"
+    msg += f"- <b>VAM Score:</b> {result.valuation_score:.2f}\n"
+    msg += f"- <b>Tỷ trọng lý thuyết:</b> CP {result.equity_weight:.1f}% | TP {result.bond_weight:.1f}% | Vàng {result.gold_weight:.1f}%\n"
+    msg += f"- <b>Rút vốn/năm:</b> {result.withdrawal_rate:.1f}%\n\n"
+    
+    msg += f"⚖️ <b>THỰC THI ĐẢO DANH MỤC (CAPPED)</b>\n"
+    msg += f"- <b>Tỷ trọng hiện tại:</b> CP {curr_w['equity']:.1f}% | TP {curr_w['bond']:.1f}% | Vàng {curr_w['gold']:.1f}%\n"
+    msg += f"- <b>Tỷ trọng khuyến nghị:</b> CP {exec_w['equity']:.1f}% | TP {exec_w['bond']:.1f}% | Vàng {exec_w['gold']:.1f}%\n"
+    msg += f"- <b>Đảo danh mục:</b> {frict_res['actual_turnover']:.1f}% (Lý thuyết: {frict_res['raw_turnover']:.1f}%)\n"
+    msg += f"- <b>Giá trị luân chuyển:</b> {frict_res['money_turnover']:.1f} Tr VND\n"
+    msg += f"- <b>Chi phí ma sát:</b> {frict_res['est_fee_cost']*1e6:,.0f} VND\n"
+    msg += f"- <b>Lệnh:</b> {'🔴 THỰC THI' if frict_res['action_needed'] else '🟢 NẮM GIỮ (HOLD)'} - {frict_res['status']}\n\n"
+    
+    msg += f"💡 <b>KHUYẾN NGHỊ CHI TIẾT</b>\n"
+    msg += f"- <b>Quy tắc:</b> {getattr(result, 'rule_text', '')}\n"
+    msg += f"- <b>Hành động:</b> {rec.get('action', '')} - {rec.get('headline', '')}\n"
+    msg += f"- <b>Chi tiết:</b> {rec.get('detail', '')}\n\n"
+    
+    msg += f"📋 <b>DỮ LIỆU ĐẦU VÀO</b>\n"
+    msg += f"- <b>Kỹ thuật:</b> VN-Index {inputs.price_current:.1f} | MA20: {ma20_curr:.1f} | MA200: {inputs.ma200:.1f}\n"
+    msg += f"- <b>Định giá:</b> P/E {inputs.pe_current:.2f} | P/B {inputs.pb_current:.2f}\n"
+    msg += f"- <b>Động lượng:</b> Vol Ratio {vol_r:.2f}x | Ngân hàng > MA50: {bank_b:.1f}%\n"
+    msg += f"- <b>Vĩ mô:</b> Rf {inputs.rf:.2f}% | US10Y {inputs.us10y:.2f}% | US CPI {inputs.us_cpi:.2f}%\n\n"
+    msg += f"📝 <i>Dữ liệu cập nhật tự động từ vnstock & Gemini.</i>"
+    
+    print("[TELEGRAM BOT] Đang gửi báo cáo qua Telegram...")
+    msg_id = send_telegram_msg(token, chat_id, msg)
+    if msg_id: 
+        print("[TELEGRAM BOT] ✅ Gửi báo cáo cho Admin thành công!")
+        channel_id = str(GLOBAL_CONFIG.get("telegram_channel_id", "")).strip()
+        if channel_id:
+            chan_id = channel_id if (channel_id.startswith("-") or channel_id.startswith("@")) else "@" + channel_id
+            print(f"[TELEGRAM BOT] Đang forward báo cáo lên Channel {chan_id}...")
+            if forward_telegram_msg(token, chan_id, chat_id, msg_id):
+                print(f"[TELEGRAM BOT] ✅ Forward báo cáo lên Channel thành công!")
+            else:
+                print(f"[TELEGRAM BOT] ❌ Forward báo cáo lên Channel thất bại!")
+    else: 
+        print("[TELEGRAM BOT] ❌ Gửi báo cáo cho Admin thất bại!")
+
+def run_schedule_and_polling():
+    last_update_id = 0
+    print("[TELEGRAM BOT] Đợi hệ thống khởi tạo cấu hình...")
+    time.sleep(3)
+    
+    token = GLOBAL_CONFIG.get("telegram_token")
+    if token:
+        print("\n[TELEGRAM BOT] 1. Đang dọn dẹp cấu hình Webhook cũ...")
+        try:
+            requests.post(f"https://api.telegram.org/bot{token}/deleteWebhook", timeout=5)
+        except Exception as e:
+            print(f"[TELEGRAM BOT] Lỗi xóa Webhook: {e}")
+            
+    print("[TELEGRAM BOT] 2. Bắt đầu tiến trình Lập lịch & Lắng nghe tin nhắn ngầm...\n")
+
+    while True:
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            print(f"[TELEGRAM BOT] Lỗi Schedule: {e}")
+            
+        token = GLOBAL_CONFIG.get("telegram_token")
+        admin_id = str(GLOBAL_CONFIG.get("telegram_chat_id", "")).strip()
+        channel_id = str(GLOBAL_CONFIG.get("telegram_channel_id", "")).strip()
+        
+        # Tự động gán '@' cho tên channel nếu người dùng quên nhập
+        if channel_id and not channel_id.startswith("-") and not channel_id.startswith("@"):
+            channel_id = "@" + channel_id
+            
+        if token and admin_id and channel_id:
+            try:
+                url = f"https://api.telegram.org/bot{token}/getUpdates"
+                params = {"offset": last_update_id + 1, "timeout": 5}
+                resp = requests.get(url, params=params, timeout=10)
+                data = resp.json()
+                
+                if data.get("ok"):
+                    for res in data.get("result", []):
+                        last_update_id = res["update_id"]
+                        msg = res.get("message")
+                        
+                        if msg:
+                            chat_id = str(msg.get("chat", {}).get("id", ""))
+                            message_id = msg.get("message_id")
+                            text_preview = msg.get("text", "[Đính kèm/Hình ảnh]")[:30]
+                            
+                            print(f"[TELEGRAM BOT] [Nhận] Tin nhắn mới từ ID {chat_id}: {text_preview}...")
+                            
+                            if chat_id == admin_id and message_id:
+                                print(f"   ⏳ Đang thực hiện lệnh forward lên Channel {channel_id}...")
+                                success = forward_telegram_msg(token, channel_id, chat_id, message_id)
+                                if success:
+                                    print("   ✅ Forward thành công!")
+                                else:
+                                    print("   ❌ Lỗi forward: Kiểm tra lại quyền Post Messages trong Channel.")
+                            else:
+                                if chat_id != admin_id:
+                                    print(f"   ⚠️ Bỏ qua: ID người gửi ({chat_id}) không khớp Admin ID ({admin_id}).")
+            except Exception:
+                pass
+        time.sleep(2)
+
+@st.cache_resource
+def start_background_bot():
+    thread = threading.Thread(target=run_schedule_and_polling, daemon=True)
+    add_script_run_ctx(thread)
+    thread.start()
+    return thread
+
+# ---------------------------------------------------------------------------
+# GIAO DIỆN UI CHÍNH
+# ---------------------------------------------------------------------------
 def render():
     st.markdown(
         """
         <style>
-        [data-testid="stMetricValue"] {
-            font-size: clamp(1.1rem, 1.8vw, 1.8rem) !important;
-            white-space: normal !important; 
-        }
-        .prob-card {
-            background-color: #1E293B;
-            border-radius: 6px;
-            padding: 8px 12px;
-            flex: 1 1 calc(25% - 10px);
-            min-width: 110px;
-            margin-bottom: 6px;
-            border: 1px solid #334155;
-            text-align: center;
-        }
-        .prob-title {
-            font-size: 0.78rem;
-            color: #94A3B8;
-            font-weight: 600;
-            white-space: nowrap;
-        }
-        .prob-value {
-            font-size: 1.15rem;
-            font-weight: 700;
-            margin-top: 2px;
-        }
+        [data-testid="stMetricValue"] { font-size: clamp(1.1rem, 1.8vw, 1.8rem) !important; white-space: normal !important; }
+        .prob-card { background-color: #1E293B; border-radius: 6px; padding: 8px 12px; flex: 1 1 calc(25% - 10px); min-width: 110px; margin-bottom: 6px; border: 1px solid #334155; text-align: center; }
+        .prob-title { font-size: 0.78rem; color: #94A3B8; font-weight: 600; white-space: nowrap; }
+        .prob-value { font-size: 1.15rem; font-weight: 700; margin-top: 2px; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -60,14 +527,15 @@ def render():
 
     SHEETS_ON = sheets_configured()
 
+    if "vault_loaded" not in st.session_state:
+        st.session_state.update(load_secure_vault())
+        st.session_state.vault_loaded = True
+
+    global DEFAULTS
     DEFAULTS = {
-        "age": 40,
-        "portfolio_nav": 1000.0,
-        "curr_w_equity": 60.0,
-        "curr_w_bond": 25.0,
-        "curr_w_gold": 15.0,
-        "max_turnover": 25.0,
-        "fee_rate": 0.15,
+        "age": 40, "portfolio_nav": 1000.0,
+        "curr_w_equity": 60.0, "curr_w_bond": 25.0, "curr_w_gold": 15.0,
+        "max_turnover": 25.0, "fee_rate": 0.15,
         "pe_current": 14.2, "pe_min": 10.0, "pe_max": 20.0,
         "pb_current": 1.72, "pb_min": 1.35, "pb_max": 2.60,
         "rf": 2.75, "erp_min": 1.5, "erp_max": 7.0,
@@ -77,232 +545,34 @@ def render():
         "eps_growth_exp": 10.0, "eps_growth_benchmark": 8.0,
         "price_current": 1250.5, "ma20": 1255.0, "ma200": 1265.2,
         "volatility_current": 16.2, "volatility_avg": 17.5,
-        "drawdown_pct": 4.2,
-        "us10y": 4.25, "us_cpi": 2.90,
-        "vol_ratio": 1.05,
-        "bank_breadth": 65.0,
-        "method": "step",
-        "gemini_api_key": "",
-        "investment_notes": "",
+        "drawdown_pct": 4.2, "us10y": 4.25, "us_cpi": 2.90,
+        "vol_ratio": 1.05, "bank_breadth": 65.0,
+        "method": "step", "investment_notes": "",
+        "gemini_api_key": get_secret("GEMINI_API_KEY", ""),
+        "telegram_token": get_secret("TELEGRAM_BOT_TOKEN", ""),
+        "telegram_chat_id": get_secret("TELEGRAM_CHAT_ID", ""),
+        "telegram_channel_id": get_secret("TELEGRAM_CHANNEL_ID", ""),
+        "schedule_mode": "Không",
+        "schedule_time": "08:00",
+        "telegram_notify_mode": "Luôn gửi",
     }
 
     for key, val in DEFAULTS.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
+        if key not in st.session_state: st.session_state[key] = val
+        if key in SENSITIVE_KEYS and get_secret(key.upper()): st.session_state[key] = get_secret(key.upper())
 
-    if "log" not in st.session_state:
-        st.session_state.log = []
+    if "log" not in st.session_state: st.session_state.log = []
 
-    if "show_constitution" not in st.session_state:
-        st.session_state.show_constitution = False
+    # Đồng bộ cấu hình thời gian thực ra GLOBAL_CONFIG cho Background Thread
+    global GLOBAL_CONFIG
+    GLOBAL_CONFIG.clear()
+    GLOBAL_CONFIG.update(st.session_state)
 
-    # ---------------------------------------------------------------------------
-    # NÂNG CẤP 1 & 2: HMM Soft Probabilities kết hợp VN-FCI Liquidity Engine
-    # ---------------------------------------------------------------------------
-    def calculate_hmm_market_clock(inputs: VAMInputs, ma20_val: float) -> dict:
-        pe_norm = (inputs.pe_current - inputs.pe_min) / max(0.01, (inputs.pe_max - inputs.pe_min))
-        pb_norm = (inputs.pb_current - inputs.pb_min) / max(0.01, (inputs.pb_max - inputs.pb_min))
-        val_score = float(np.clip((pe_norm + pb_norm) / 2.0, 0.0, 1.0))
-
-        p = inputs.price_current
-        ma200 = inputs.ma200
-        trend_long = (p - ma200) / max(1.0, ma200)
-        trend_short = (p - ma20_val) / max(1.0, ma20_val)
-        trend_score = float(np.clip((trend_long * 0.7 + trend_short * 0.3) * 5.0, -1.5, 1.5))
-
-        vol_ratio = inputs.volatility_current / max(0.1, inputs.volatility_avg)
-        dd_norm = float(np.clip(inputs.drawdown_pct / 30.0, 0.0, 1.5))
-        stress_score = float(np.clip((vol_ratio - 1.0) + dd_norm, -1.0, 2.0))
-
-        vr = float(st.session_state.get("vol_ratio", 1.0))
-        bb = float(st.session_state.get("bank_breadth", 50.0)) / 100.0
-        fci_score = float(np.clip((vr - 1.0) * 1.5 + (bb - 0.5) * 2.0, -1.5, 1.5))
-
-        logit_rec = (1.0 - val_score) * 2.5 + stress_score * 0.8 - max(0.0, trend_score) * 1.0 + fci_score * 0.5
-        logit_exp = trend_score * 2.2 + (0.5 - abs(val_score - 0.5)) * 1.2 - stress_score * 1.0 + fci_score * 1.5
-        logit_slo = val_score * 2.5 - trend_short * 1.2 + (vol_ratio - 1.0) * 1.0 - fci_score * 0.8
-        logit_con = -trend_score * 2.0 + stress_score * 1.5 + (val_score * 0.5) - fci_score * 1.2
-
-        logits = np.array([logit_rec, logit_exp, logit_slo, logit_con], dtype=float)
-        exp_logits = np.exp(logits - np.max(logits))
-        probs = exp_logits / np.sum(exp_logits)
-
-        p_recovery, p_expansion, p_slowdown, p_recession = probs[0], probs[1], probs[2], probs[3]
-
-        centers_deg = np.array([180.0, 285.0, 352.5, 90.0])
-        centers_rad = np.radians(centers_deg)
-
-        mean_x = float(np.sum(probs * np.sin(centers_rad)))
-        mean_y = float(np.sum(probs * np.cos(centers_rad)))
-
-        exp_angle_rad = math.atan2(mean_x, mean_y)
-        exp_angle_deg = math.degrees(exp_angle_rad) % 360.0
-
-        clock_hour = round(float(exp_angle_deg / 30.0), 1)
-        if clock_hour == 0.0:
-            clock_hour = 12.0
-
-        h_int = int(math.floor(clock_hour))
-        m_int = int((clock_hour - h_int) * 60)
-        time_str = f"{h_int:02d}:{m_int:02d}"
-
-        regimes_map = [
-            ("RECOVERY", "TÍCH LŨY & PHỤC HỒI (RECOVERY / 6H)", p_recovery,
-             "Định giá chiết khấu sâu, xác suất phục hồi mở rộng. Dòng tiền giá trị chủ động gom tài sản rẻ.",
-             "Chiến lược: Tối đa hóa tỷ trọng cổ phiếu giá trị, chủ động giải ngân theo từng nhịp điều chỉnh."),
-            ("EXPANSION", "TĂNG TRƯỞNG & BÙNG NỔ (EXPANSION / 9H)", p_expansion,
-             "Đồng thuận kỹ thuật và vĩ mô mạnh mẽ. Tăng trưởng lợi nhuận nâng đỡ định giá tăng bền vững.",
-             "Chiến lược: Tối ưu hóa nắm giữ vị thế (Buy & Hold), duy trì tỷ trọng cổ phiếu cao theo VAM."),
-            ("SLOWDOWN", "VÙNG ĐỈNH & PHÂN PHỐI (SLOWDOWN / 12H)", p_slowdown,
-             "Định giá thị trường căng cứng, xác suất quá nhiệt tăng cao, xuất hiện áp lực phân phối dòng tiền.",
-             "Chiến lược: Hiện thực hóa lợi nhuận từng phần, nâng tỷ trọng phòng thủ với Vàng và Trái phiếu."),
-            ("RECESSION", "SUY THOÁI & SUY YẾU (CONTRACTION / 3H)", p_recession,
-             "Gãy xu hướng dài hạn MA200, áp lực giải chấp diện rộng, định giá chưa đủ rẻ để tạo đáy.",
-             "Chiến lược: Phòng thủ kỷ luật tối đa, hạn chế bắt dao rơi, ưu tiên bảo toàn vốn bằng Trái phiếu.")
-        ]
-        dominant = max(regimes_map, key=lambda x: x[2])
-
-        if fci_score >= 0.4:
-            fci_state = "Dồi Dào (Nới lỏng tiền tệ)"
-            fci_color = "#4ADE80"
-        elif fci_score <= -0.4:
-            fci_state = "Thắt Chặt (Cạn kiệt thanh khoản)"
-            fci_color = "#F87171"
-        else:
-            fci_state = "Trung Tính (Thanh khoản ổn định)"
-            fci_color = "#FACC15"
-
-        return {
-            "hour": clock_hour,
-            "time_str": time_str,
-            "phase": dominant[1],
-            "desc": dominant[3],
-            "bias": dominant[4],
-            "fci_score": fci_score,
-            "fci_state": fci_state,
-            "fci_color": fci_color,
-            "probabilities": {
-                "Recovery": p_recovery,
-                "Expansion": p_expansion,
-                "Slowdown": p_slowdown,
-                "Recession": p_recession,
-            }
-        }
+    # Đảm bảo luồng ngầm khởi động 1 lần duy nhất
+    start_background_bot()
 
     # ---------------------------------------------------------------------------
-    # NÂNG CẤP 3: Thuật toán Kiểm soát Ma sát Thực thi
-    # ---------------------------------------------------------------------------
-    def calculate_execution_friction(
-        raw_weights: dict,
-        curr_weights: dict,
-        max_turnover_pct: float,
-        fee_rate_pct: float,
-        portfolio_nav_mil: float,
-        deadband_pct: float = 3.0
-    ) -> dict:
-        keys = ["equity", "bond", "gold"]
-        w_prev = np.array([curr_weights[k] for k in keys], dtype=float)
-        w_desired = np.array([raw_weights[k] for k in keys], dtype=float)
-
-        raw_diff = w_desired - w_prev
-        turnover_raw = float(np.sum(np.abs(raw_diff)) / 2.0)
-
-        if turnover_raw < deadband_pct:
-            w_exec = w_prev.copy()
-            status = "Giữ Nguyên (Độ lệch trong vùng dung sai < 3%)"
-            action_needed = False
-            turnover_actual = 0.0
-        else:
-            action_needed = True
-            if turnover_raw > max_turnover_pct:
-                scale = max_turnover_pct / max(0.001, turnover_raw)
-                w_exec = w_prev + scale * raw_diff
-                status = f"Điều chỉnh có kiểm soát (Cắt trần đảo danh mục ở {max_turnover_pct:.1f}%)"
-                turnover_actual = max_turnover_pct
-            else:
-                w_exec = w_desired.copy()
-                status = "Thực thi toàn phần theo tỷ trọng mục tiêu VAM"
-                turnover_actual = turnover_raw
-
-        w_exec = (w_exec / np.sum(w_exec)) * 100.0
-        money_turnover = (turnover_actual / 100.0) * portfolio_nav_mil
-        est_fee_cost = money_turnover * (fee_rate_pct / 100.0)
-
-        exec_weights = {keys[i]: round(float(w_exec[i]), 1) for i in range(len(keys))}
-
-        return {
-            "exec_weights": exec_weights,
-            "raw_turnover": turnover_raw,
-            "actual_turnover": turnover_actual,
-            "money_turnover": money_turnover,
-            "est_fee_cost": est_fee_cost,
-            "status": status,
-            "action_needed": action_needed,
-        }
-
-    # ---------------------------------------------------------------------------
-    # Vẽ Biểu đồ Đồng hồ Chu kỳ (Plotly Polar Gauge)
-    # ---------------------------------------------------------------------------
-    def draw_market_clock_chart(clock_val: float):
-        needle_angle = (clock_val % 12.0) * 30.0
-
-        fig = go.Figure()
-
-        quadrants = [
-            {"theta_mid": 45, "name": "12h - 3h: Phân phối/Rơi", "color": "rgba(239, 68, 68, 0.22)"},
-            {"theta_mid": 135, "name": "3h - 6h: Downtrend/Đáy", "color": "rgba(249, 115, 22, 0.22)"},
-            {"theta_mid": 225, "name": "6h - 9h: Tích lũy/Bứt phá", "color": "rgba(34, 197, 94, 0.22)"},
-            {"theta_mid": 315, "name": "9h - 12h: Tăng trưởng", "color": "rgba(59, 130, 246, 0.22)"},
-        ]
-        for q in quadrants:
-            fig.add_trace(go.Barpolar(
-                r=[0.80],
-                theta=[q["theta_mid"]],
-                width=[90],
-                name=q["name"],
-                marker_color=q["color"],
-                showlegend=False,
-                hoverinfo="none"
-            ))
-
-        fig.add_trace(go.Scatterpolar(
-            r=[0, 0.72],
-            theta=[needle_angle, needle_angle],
-            mode="lines+markers",
-            line=dict(color="#EF4444", width=3.5),
-            marker=dict(size=[6, 12], color=["#1E293B", "#EF4444"]),
-            name=f"Vị thế HMM: {clock_val:.1f} Giờ",
-            hoverinfo="name"
-        ))
-
-        fig.update_layout(
-            autosize=True,
-            polar=dict(
-                radialaxis=dict(visible=False, range=[0, 1.0]),
-                angularaxis=dict(
-                    direction="clockwise",
-                    period=360,
-                    rotation=90,
-                    tickmode="array",
-                    tickvals=[0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330],
-                    ticktext=[
-                        "<b>12h<br>(ĐỈNH)</b>", "1h", "2h",
-                        "<b>3h<br>(Rơi)</b>", "4h", "5h",
-                        "<b>6h<br>(ĐÁY)</b>", "7h", "8h",
-                        "<b>9h<br>(Tăng)</b>", "10h", "11h"
-                    ],
-                    tickfont=dict(size=11, color="#94A3B8")
-                )
-            ),
-            margin=dict(l=55, r=55, t=45, b=45),
-            height=370,
-            paper_bgcolor="rgba(0,0,0,0)",
-            showlegend=False
-        )
-        return fig
-
-    # ---------------------------------------------------------------------------
-    # Các hàm phụ trợ cục bộ
+    # UTILS GIAO DIỆN
     # ---------------------------------------------------------------------------
     def handle_json_import():
         uploaded = st.session_state.get("json_file_uploader")
@@ -310,429 +580,236 @@ def render():
             try:
                 imported_data = json.load(uploaded)
                 for k, v in imported_data.items():
-                    if k in DEFAULTS:
+                    if k in DEFAULTS and k not in SENSITIVE_KEYS:
                         if k == "age": st.session_state[k] = int(v)
                         elif isinstance(v, (int, float)): st.session_state[k] = float(v)
                         else: st.session_state[k] = v
-                st.toast("✅ Đã cập nhật tham số từ file JSON!", icon="📥")
-            except Exception as e:
-                st.error(f"❌ Lỗi đọc file JSON: {e}")
+                st.toast("✅ Đã cập nhật tham số (Bỏ qua key nhạy cảm)!", icon="📥")
+            except Exception as e: st.error(f"❌ Lỗi JSON: {e}")
 
     def handle_gemini_json_import():
         uploaded = st.session_state.get("gemini_json_uploader")
         if uploaded is not None:
             try:
                 data = json.load(uploaded)
-                api_key = data.get("api_key") or data.get("GEMINI_API_KEY") or data.get("key") or next(iter(data.values()), "")
+                api_key = data.get("api_key") or data.get("GEMINI_API_KEY") or next(iter(data.values()), "")
                 if api_key and isinstance(api_key, str):
                     st.session_state["gemini_api_key"] = api_key.strip()
-                    st.toast("✅ Đã nạp Gemini API Key thành công!", icon="🔑")
-                else:
-                    st.error("❌ Định dạng API Key không hợp lệ trong file JSON!")
-            except Exception as e:
-                st.error(f"❌ Lỗi đọc file JSON API Key: {e}")
+                    st.toast("✅ Đã nạp Gemini API Key qua file JSON!", icon="🔑")
+            except Exception as e: st.error(f"❌ Lỗi nạp Key: {e}")
 
-    def is_local_env():
-        return os.name == 'nt' or os.path.exists('/home/user')
-
-    def save_local_file(content_or_df, default_ext, file_types, initial_file):
-        if not is_local_env():
-            return False, "Server Cloud không hỗ trợ chọn thư mục trực tiếp."
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.attributes("-topmost", True)
-            root.withdraw()
-            file_path = filedialog.asksaveasfilename(defaultextension=default_ext, filetypes=file_types, initialfile=initial_file)
-            root.destroy()
-            if file_path:
-                if isinstance(content_or_df, pd.DataFrame):
-                    content_or_df.to_csv(file_path, index=False, encoding="utf-8-sig")
-                else:
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(content_or_df)
-                return True, file_path
-            return False, "Đã hủy lưu."
-        except Exception as e:
-            return False, f"Lỗi giao diện hệ thống: {e}"
-
-    def fetch_vnstock_market_data(progress_bar, status_box) -> dict:
-        try:
-            from vnstock import Reference, Fundamental, Quote
-        except ImportError:
-            st.error("⚠️ Thư viện `vnstock` chưa được cài đặt!")
-            return {}
-
-        results = {}
-        status_box.update(label="📈 Đang tải chuỗi giá & thanh khoản VN-Index 2 năm...", state="running")
-        progress_bar.progress(5)
-        try:
-            end_d = date.today()
-            start_d = end_d - timedelta(days=730)
-            quote_idx = Quote(symbol="VNINDEX", source="VCI")
-            df_idx = quote_idx.history(start=start_d.isoformat(), end=end_d.isoformat(), interval="1D")
-            
-            if df_idx is not None and not df_idx.empty:
-                cot_close = "close" if "close" in df_idx.columns else df_idx.columns[-2]
-                close_prices = df_idx[cot_close].dropna()
-                if close_prices.iloc[-1] < 200: close_prices = close_prices * 1000
-                
-                p_curr = float(close_prices.iloc[-1])
-                ma20_val = float(close_prices.iloc[-20:].mean()) if len(close_prices) >= 20 else float(close_prices.mean())
-                ma200_val = float(close_prices.iloc[-200:].mean()) if len(close_prices) >= 200 else float(close_prices.mean())
-                
-                returns = close_prices.pct_change().dropna()
-                vol_curr = float(returns.iloc[-252:].std() * np.sqrt(252) * 100) if len(returns) >= 252 else float(returns.std() * np.sqrt(252) * 100)
-                vol_avg = float(returns.std() * np.sqrt(252) * 100)
-                
-                peak = close_prices.iloc[-252:].cummax() if len(close_prices) >= 252 else close_prices.cummax()
-                dd = (close_prices.iloc[-252:] - peak) / peak
-                drawdown_val = float(abs(dd.min()) * 100)
-
-                cot_vol = next((c for c in ["volume", "total_volume", "vol"] if c in df_idx.columns), None)
-                if cot_vol:
-                    v_series = df_idx[cot_vol].dropna()
-                    v_ma20 = float(v_series.iloc[-20:].mean()) if len(v_series) >= 20 else 1.0
-                    v_ma200 = float(v_series.iloc[-200:].mean()) if len(v_series) >= 200 else 1.0
-                    results["vol_ratio"] = round(float(v_ma20 / max(1.0, v_ma200)), 2)
-                else:
-                    results["vol_ratio"] = 1.0
-
-                results["price_current"] = round(p_curr, 1)
-                results["ma20"] = round(ma20_val, 1)
-                results["ma200"] = round(ma200_val, 1)
-                results["volatility_current"] = round(vol_curr, 1)
-                results["volatility_avg"] = round(vol_avg, 1)
-                results["drawdown_pct"] = round(drawdown_val, 1)
-        except Exception as e:
-            st.warning(f"Không thể tính kỹ thuật VNINDEX từ vnstock: {e}")
-
-        status_box.update(label="📋 Lấy danh sách rổ VN30 & Nhóm Ngân hàng...", state="running")
-        progress_bar.progress(10)
-        try:
-            ref = Reference()
-            ket_qua_ref = ref.index.members(symbol="VN30")
-            cot_symbol = next((c for c in ["symbol", "ticker", "stock_code", "code"] if c in ket_qua_ref.columns), ket_qua_ref.columns[0]) if isinstance(ket_qua_ref, pd.DataFrame) else None
-            danh_sach_ma = ket_qua_ref[cot_symbol].tolist() if cot_symbol else list(ket_qua_ref)
-        except Exception as e:
-            st.error(f"Lỗi lấy VN30: {e}")
-            return results
-
-        tong_ma = len(danh_sach_ma)
-        fa = Fundamental()
-        list_pe, list_pb, list_roe = [], [], []
-
-        bank_tickers = {"VCB", "BID", "CTG", "TCB", "MBB", "ACB", "VPB", "HDB", "STB"}
-        bank_above_ma50_count = 0
-        bank_total_detected = 0
-
-        status_box.update(label=f"🔄 Phân tích {tong_ma} mã VN30 (Chờ 10s/mã)...", state="running")
-
-        for idx, ma in enumerate(danh_sach_ma, start=1):
-            progress_bar.progress(int(10 + (idx / tong_ma) * 85))
-            status_box.write(f"⏳ [{idx}/{tong_ma}] Phân tích mã **{ma}**...")
-            try:
-                df_ratio = fa.equity(ma).ratio(period="quarter")
-                if df_ratio is not None and not df_ratio.empty:
-                    cols_ky = [c for c in df_ratio.columns if re.match(r"\d{4}-Q\d", str(c))]
-                    if cols_ky:
-                        cols_ky.sort(key=lambda x: (int(x.split("-")[0]), int(x.split("-")[1].replace("Q", ""))), reverse=True)
-                        cot_gan = cols_ky[0]
-                        r_eps = df_ratio[df_ratio.get("item_id", pd.Series()) == "trailing_eps"]
-                        r_roe = df_ratio[df_ratio.get("item_id", pd.Series()) == "roe_trailling"]
-                        r_bvps = df_ratio[df_ratio.get("item_id", pd.Series()) == "book_value_per_share_bvps"]
-
-                        eps_val = float(r_eps[cot_gan].values[0]) if not r_eps.empty else None
-                        roe_val = float(r_roe[cot_gan].values[0]) if not r_roe.empty else None
-                        bvps_val = float(r_bvps[cot_gan].values[0]) if not r_bvps.empty else None
-
-                        q = Quote(symbol=ma, source="VCI")
-                        df_q = q.history(start=(date.today()-timedelta(weeks=12)).isoformat(), end=date.today().isoformat(), interval="1D")
-                        if df_q is not None and not df_q.empty:
-                            cot_g = "close" if "close" in df_q.columns else df_q.columns[-2]
-                            gia_dong = float(df_q.iloc[-1][cot_g])
-                            if gia_dong < 2000: gia_dong *= 1000
-
-                            if eps_val and eps_val > 0:
-                                pe_calc = gia_dong / eps_val
-                                if 1.0 <= pe_calc <= 70.0: list_pe.append(pe_calc)
-                            if bvps_val and bvps_val > 0:
-                                pb_calc = gia_dong / bvps_val
-                                if 0.2 <= pb_calc <= 15.0: list_pb.append(pb_calc)
-                            if roe_val is not None:
-                                roe_norm = roe_val * 100.0 if abs(roe_val) <= 1.0 else roe_val
-                                if -50.0 <= roe_norm <= 100.0: list_roe.append(roe_norm)
-
-                            if ma in bank_tickers:
-                                bank_total_detected += 1
-                                c_series = df_q[cot_g].dropna()
-                                ma50 = float(c_series.iloc[-50:].mean()) if len(c_series) >= 50 else float(c_series.mean())
-                                if gia_dong >= ma50:
-                                    bank_above_ma50_count += 1
-            except Exception:
-                pass
-            time.sleep(10.0)
-
-        if list_pe: results["pe_current"] = round(float(np.median(list_pe)), 2)
-        if list_pb: results["pb_current"] = round(float(np.median(list_pb)), 2)
-        if list_roe: results["roe_current"] = round(float(np.median(list_roe)), 2)
-
-        if bank_total_detected > 0:
-            results["bank_breadth"] = round(float((bank_above_ma50_count / bank_total_detected) * 100.0), 1)
-        else:
-            results["bank_breadth"] = 50.0
-
-        progress_bar.progress(100)
-        status_box.update(label="✅ Hoàn tất lấy dữ liệu từ vnstock!", state="complete", expanded=False)
-        return results
-
-    # ---------------------------------------------------------------------------
-    # TỐI ƯU HÓA GEMINI API: Tập trung vào 4 Snapshot vĩ mô hiệu quả cao nhất
-    # ---------------------------------------------------------------------------
-    MISSING_PARAMS_KEYS = ["rf", "us10y", "us_cpi", "eps_growth_exp"]
-
-    def fetch_missing_params_via_gemini(api_key: str) -> dict:
-        try:
-            from google import genai
-            from google.genai import types
-        except ImportError:
-            st.error("⚠️ Chưa cài đặt thư viện `google-genai`!")
-            return {"error": "Chưa cài đặt google-genai"}
-
-        client = genai.Client(api_key=api_key.strip())
-        
-        prompt = """
-        Bạn là chuyên gia phân tích kinh tế vĩ mô và định lượng đầu tư. 
-        Hãy DÙNG GOOGLE SEARCH để tra cứu chính xác 4 chỉ số vĩ mô cập nhật mới nhất tính đến thời điểm hiện tại:
-
-        1. 'rf': Lợi suất Trái phiếu Chính phủ Việt Nam kỳ hạn 10 năm (VN10Y Government Bond Yield, đơn vị %). Tra cứu từ nguồn HNX, Kho bạc Nhà nước, hoặc cổng thông tin tài chính (Vietstock, Investing.com).
-        2. 'us10y': Lợi suất Trái phiếu Kho bạc Mỹ kỳ hạn 10 năm (US 10-Year Treasury Yield, đơn vị %). Tra cứu từ US Treasury, MarketWatch hoặc CNBC.
-        3. 'us_cpi': Chỉ số Lạm phát CPI của Mỹ theo năm (US CPI YoY %, số liệu chính thức kỳ công bố mới nhất từ Cục Thống kê Lao động Mỹ BLS).
-        4. 'eps_growth_exp': Mức dự phóng tăng trưởng lợi nhuận/EPS bình quân cả năm của VN-Index / VN30 (đơn vị %) dựa trên các báo cáo chiến lược thị trường mới nhất của các công ty chứng khoán lớn (VNDirect, SSI Research, HSC, Vietcap).
-
-        HÃY CHỈ TRẢ VỀ DUY NHẤT MỘT KHỐI JSON HỢP LỆ (các giá trị là số thực phần trăm float, không kèm ký tự '%', không thêm bất kỳ văn bản giải thích nào khác):
-        {
-            "rf": float,
-            "us10y": float,
-            "us_cpi": float,
-            "eps_growth_exp": float
-        }
-        """
-
-        CANDIDATE_MODELS = [
-            "gemini-3.1-pro-preview",
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
+    def draw_market_clock_chart(clock_val: float):
+        needle_angle = (clock_val % 12.0) * 30.0
+        fig = go.Figure()
+        quadrants = [
+            {"theta_mid": 45, "name": "12h - 3h: Phân phối/Rơi", "color": "rgba(239, 68, 68, 0.22)"},
+            {"theta_mid": 135, "name": "3h - 6h: Downtrend/Đáy", "color": "rgba(249, 115, 22, 0.22)"},
+            {"theta_mid": 225, "name": "6h - 9h: Tích lũy/Bứt phá", "color": "rgba(34, 197, 94, 0.22)"},
+            {"theta_mid": 315, "name": "9h - 12h: Tăng trưởng", "color": "rgba(59, 130, 246, 0.22)"},
         ]
-
-        try:
-            available_models = [m.name.replace("models/", "") for m in client.models.list() if "generateContent" in getattr(m, "supported_generation_methods", []) or "generateContent" in getattr(m, "supported_actions", [])]
-            for av_m in available_models:
-                if av_m not in CANDIDATE_MODELS and "embedding" not in av_m:
-                    CANDIDATE_MODELS.append(av_m)
-        except Exception:
-            pass
-
-        last_err = ""
-
-        for model_name in CANDIDATE_MODELS:
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        tools=[{"google_search": {}}]
-                    ),
-                )
-                
-                raw_text = response.text.strip() if response.text else ""
-                
-                match = re.search(r"\{[\s\S]*?\}", raw_text)
-                if match:
-                    json_str = match.group(0)
-                    data = json.loads(json_str)
-                    
-                    cleaned_data = {}
-                    for k in MISSING_PARAMS_KEYS:
-                        if k in data and data[k] is not None:
-                            try:
-                                cleaned_data[k] = float(data[k])
-                            except (ValueError, TypeError):
-                                pass
-                    
-                    if len(cleaned_data) >= 2:
-                        return cleaned_data
-
-            except Exception as exc:
-                last_err = f"[{model_name}] {exc}"
-                continue
-
-        return {"error": f"Không có model nào phản hồi thành công. Lỗi cuối: {last_err}"}
-
+        for q in quadrants:
+            fig.add_trace(go.Barpolar(r=[0.80], theta=[q["theta_mid"]], width=[90], name=q["name"], marker_color=q["color"], showlegend=False, hoverinfo="none"))
+        fig.add_trace(go.Scatterpolar(r=[0, 0.72], theta=[needle_angle, needle_angle], mode="lines+markers", line=dict(color="#EF4444", width=3.5), marker=dict(size=[6, 12], color=["#1E293B", "#EF4444"]), name=f"Vị thế HMM: {clock_val:.1f} Giờ", hoverinfo="name"))
+        fig.update_layout(autosize=True, polar=dict(radialaxis=dict(visible=False, range=[0, 1.0]), angularaxis=dict(direction="clockwise", period=360, rotation=90, tickmode="array", tickvals=[0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330], ticktext=["<b>12h<br>(ĐỈNH)</b>", "1h", "2h", "<b>3h<br>(Rơi)</b>", "4h", "5h", "<b>6h<br>(ĐÁY)</b>", "7h", "8h", "<b>9h<br>(Tăng)</b>", "10h", "11h"], tickfont=dict(size=11, color="#94A3B8"))), margin=dict(l=55, r=55, t=45, b=45), height=370, paper_bgcolor="rgba(0,0,0,0)", showlegend=False)
+        return fig
+        
     def draw_plotly_pie_chart(weights, labels, colors, center_text="TARGET"):
-        fig = go.Figure(data=[go.Pie(
-            labels=labels, values=weights, hole=0.48,
-            marker=dict(colors=colors, line=dict(color="#FFFFFF", width=2.5)),
-            textinfo="label+percent", hoverinfo="label+value+percent",
-            textfont=dict(size=12), insidetextorientation="horizontal",
-        )])
-        fig.update_layout(
-            showlegend=True,
-            legend=dict(orientation="h", yanchor="bottom", y=-0.18, xanchor="center", x=0.5, font=dict(size=11)),
-            margin=dict(l=20, r=20, t=20, b=20), height=370,
-            paper_bgcolor="rgba(0,0,0,0)",
-            annotations=[dict(text=f"<b>{center_text}</b>", x=0.5, y=0.5, font_size=11, showarrow=False)]
-        )
+        fig = go.Figure(data=[go.Pie(labels=labels, values=weights, hole=0.48, marker=dict(colors=colors, line=dict(color="#FFFFFF", width=2.5)), textinfo="label+percent", hoverinfo="label+value+percent", textfont=dict(size=12), insidetextorientation="horizontal")])
+        fig.update_layout(showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=-0.18, xanchor="center", x=0.5, font=dict(size=11)), margin=dict(l=20, r=20, t=20, b=20), height=370, paper_bgcolor="rgba(0,0,0,0)", annotations=[dict(text=f"<b>{center_text}</b>", x=0.5, y=0.5, font_size=11, showarrow=False)])
         return fig
 
     # ---------------------------------------------------------------------------
-    # Sidebar - Nhập liệu & Cấu hình
+    # GIAO DIỆN CẤU HÌNH SIDEBAR
     # ---------------------------------------------------------------------------
     st.sidebar.title("⚙️ Thông số đầu vào")
+    
+    server_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    st.sidebar.info(f"🕒 Giờ Server hiện tại: **{server_time}**")
 
-    with st.sidebar.expander("📁 Quản lý File Config (JSON)", expanded=False):
-        config_data = {key: st.session_state[key] for key in DEFAULTS.keys() if key != "gemini_api_key"}
-        json_string = json.dumps(config_data, indent=2, ensure_ascii=False)
-        if is_local_env():
-            if st.button("💾 Xuất File Config", use_container_width=True):
-                success, msg = save_local_file(json_string, ".json", [("JSON files", "*.json")], "vam_input_config.json")
-                if success: st.toast(f"✅ Đã lưu tại: {msg}", icon="💾")
-                elif "Đã hủy" not in msg: st.error(msg)
-        else:
-            st.download_button("💾 Tải về File Config (JSON)", file_name="vam_input_config.json", mime="application/json", data=json_string, use_container_width=True)
-        st.file_uploader("📂 Import Config từ JSON", type=["json"], key="json_file_uploader", on_change=handle_json_import)
-
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("🚀 vnstock (Chứng khoán, Kỹ thuật & Thanh khoản)", expanded=True):
-        if st.button("🚀 Lấy dữ liệu từ vnstock", use_container_width=True):
-            p_bar = st.sidebar.progress(0)
-            s_box = st.sidebar.status("Đang kết nối vnstock...", expanded=True)
-            vn_data = fetch_vnstock_market_data(p_bar, s_box)
-            if vn_data:
-                for k, v in vn_data.items():
-                    st.session_state[k] = v
-                st.sidebar.success("✅ Cập nhật vnstock & VN-FCI thành công!")
-                st.rerun()
+    with st.sidebar.expander("📁 Quản lý File Config & Bảo mật", expanded=False):
+        config_data = {k: st.session_state[k] for k in DEFAULTS.keys() if k not in SENSITIVE_KEYS}
+        st.download_button("💾 Tải File Config (JSON An toàn)", file_name="vam_input_config.json", mime="application/json", data=json.dumps(config_data, indent=2, ensure_ascii=False), use_container_width=True)
+        st.file_uploader("📂 Import Config (JSON)", type=["json"], key="json_file_uploader", on_change=handle_json_import)
+        
+        st.markdown("---")
+        if CRYPTO_ENABLED:
+            if st.button("🔒 Mã hóa & Lưu API/Token cục bộ", help="Lưu Telegram & Gemini API bằng AES-128"):
+                secure_data = {k: st.session_state.get(k) for k in SENSITIVE_KEYS}
+                if save_secure_vault(secure_data): 
+                    st.toast("✅ Đã lưu Vault mã hóa thành công!", icon="🔒")
+                    GLOBAL_CONFIG.update(secure_data)
+                else: st.error("❌ Lỗi mã hóa lưu trữ!")
 
     with st.sidebar.expander("🤖 Gemini AI (Vĩ mô & Lãi suất)", expanded=True):
-        st.file_uploader("📂 File JSON chứa API Key", type=["json"], key="gemini_json_uploader", on_change=handle_gemini_json_import)
+        has_gemini = bool(st.session_state.get("gemini_api_key"))
+        new_gemini = st.text_input("Gemini API Key", value="", placeholder="•••••••••••••••• (Đã thiết lập)" if has_gemini else "Nhập API Key mới", type="password", help="Chỉ cho phép ghi đè, không hiển thị key cũ để bảo mật.")
+        if new_gemini:
+            st.session_state.gemini_api_key = new_gemini
+
+        st.file_uploader("📂 Hoặc nạp từ file JSON API Key", type=["json"], key="gemini_json_uploader", on_change=handle_gemini_json_import)
         
         if st.button("🌐 Gemini Auto-Fill Tham số", use_container_width=True):
             api_key = st.session_state.get("gemini_api_key", "").strip()
-            if not api_key:
-                st.sidebar.warning("⚠️ Vui lòng nạp Gemini API Key trước!")
+            if not api_key: st.sidebar.warning("⚠️ Vui lòng thiết lập API Key!")
             else:
                 try:
-                    with st.spinner("🤖 Gemini đang truy xuất vĩ mô với bộ lọc Fallback..."):
-                        missing_data = fetch_missing_params_via_gemini(api_key)
-                        
-                        if missing_data and "error" not in missing_data and isinstance(missing_data, dict):
-                            updated = 0
-                            for key in MISSING_PARAMS_KEYS:
-                                if key in missing_data and missing_data[key] is not None:
-                                    try:
-                                        val = float(missing_data[key])
-                                        st.session_state[key] = val
-                                        updated += 1
-                                    except (ValueError, TypeError):
-                                        pass
-                            
-                            if updated > 0:
-                                st.sidebar.success(f"✅ Đã nạp thành công {updated} tham số vĩ mô!")
-                                st.rerun()
-                            else:
-                                st.sidebar.error("❌ Gemini không tìm thấy dữ liệu phù hợp.")
+                    with st.spinner("🤖 Đang truy xuất..."):
+                        missing_data = fetch_missing_params_via_gemini(api_key, log_func=st.error)
+                        if missing_data and "error" not in missing_data:
+                            for key in ["rf", "us10y", "us_cpi", "eps_growth_exp"]:
+                                if key in missing_data and missing_data[key] is not None: st.session_state[key] = float(missing_data[key])
+                            st.sidebar.success("✅ Nạp thành công tham số vĩ mô!")
+                            st.rerun()
+                        else: st.sidebar.error("❌ Gemini thất bại.")
+                except Exception as exc: st.sidebar.error(f"❌ Lỗi: {exc}")
+
+    with st.sidebar.expander("📲 Telegram & Tự động hóa", expanded=False):
+        has_tele_token = bool(st.session_state.get("telegram_token"))
+        new_tele_token = st.text_input("Telegram Bot Token", value="", placeholder="•••••••• (Đã thiết lập)" if has_tele_token else "Nhập Bot Token mới", type="password", help="Chỉ cho phép ghi đè, không hiển thị token cũ.")
+        if new_tele_token:
+            st.session_state.telegram_token = new_tele_token
+
+        has_tele_chat = bool(st.session_state.get("telegram_chat_id"))
+        new_tele_chat = st.text_input("Telegram Admin Chat ID", value="", placeholder="•••••••• (Đã thiết lập)" if has_tele_chat else "Nhập Chat ID của bạn", type="password", help="Chỉ cho phép ghi đè, không hiển thị ID cũ.")
+        if new_tele_chat:
+            st.session_state.telegram_chat_id = new_tele_chat
+
+        has_tele_chan = bool(st.session_state.get("telegram_channel_id"))
+        new_tele_chan = st.text_input("Public Channel ID (VD: @vam_channel)", value="", placeholder="•••••••• (Đã thiết lập)" if has_tele_chan else "Nhập Channel Username/ID", type="password", help="Chỉ cho phép ghi đè, không hiển thị ID cũ.")
+        if new_tele_chan:
+            st.session_state.telegram_channel_id = new_tele_chan
+        
+        schedule_modes = ["Không", "Hàng ngày", "Hàng tuần", "Hàng tháng"]
+        st.session_state.schedule_mode = st.selectbox("Chu kỳ tự động", schedule_modes, index=schedule_modes.index(st.session_state.get("schedule_mode", "Không")))
+        st.session_state.schedule_time = st.text_input("Thời gian chạy (HH:MM)", value=st.session_state.get("schedule_time", "08:00"))
+        
+        notify_modes = ["Luôn gửi", "Chỉ gửi khi vượt ngưỡng thực thi"]
+        st.session_state.telegram_notify_mode = st.selectbox("Điều kiện gửi báo cáo", notify_modes, index=notify_modes.index(st.session_state.get("telegram_notify_mode", "Luôn gửi")))
+
+        if st.button("Kiểm tra Bot Telegram", use_container_width=True):
+            test_token = st.session_state.get("telegram_token")
+            test_chat = st.session_state.get("telegram_chat_id")
+            test_chan = st.session_state.get("telegram_channel_id")
+            
+            if not test_token or not test_chat:
+                st.error("⚠️ Vui lòng nhập Token và Admin Chat ID trước!")
+            else:
+                msg_id = send_telegram_msg(test_token, test_chat, "✅ Hệ thống VAM Bot kết nối thành công! Đang test tính năng Forward...")
+                if msg_id:
+                    st.toast("Đã gửi tin nhắn cho Admin!", icon="📨")
+                    if test_chan:
+                        chan_id = test_chan if (test_chan.startswith("-") or test_chan.startswith("@")) else "@" + test_chan
+                        if forward_telegram_msg(test_token, chan_id, test_chat, msg_id):
+                            st.success(f"✅ Gửi Admin và Forward lên Channel {chan_id} thành công!")
+                            st.toast("Forward thành công!", icon="🚀")
                         else:
-                            err_msg = missing_data.get("error", "Lỗi phản hồi API") if isinstance(missing_data, dict) else "Lỗi kết nối"
-                            st.sidebar.error(f"❌ Gemini thất bại: {err_msg}. Dữ liệu vnstock vẫn được bảo toàn nguyên vẹn!")
-                except Exception as exc:
-                    st.sidebar.error(f"❌ Xử lý Gemini bị gián đoạn: {exc}. Dữ liệu vnstock được giữ nguyên!")
+                            st.error(f"❌ Gửi Admin thành công nhưng Forward lên {chan_id} thất bại. Kiểm tra quyền Post Messages của Bot trong Channel!")
+                    else:
+                        st.success("✅ Gửi Admin thành công! (Chưa cấu hình Channel)")
+                else:
+                    st.error("❌ Gửi thất bại, kiểm tra lại Token hoặc Chat ID!")
+
+        current_schedule_config = f"{st.session_state.schedule_mode}_{st.session_state.schedule_time}"
+        if st.session_state.get("last_schedule_config") != current_schedule_config:
+            schedule.clear()
+            mode = st.session_state.schedule_mode
+            run_time = st.session_state.schedule_time
+            
+            if mode == "Hàng ngày": schedule.every().day.at(run_time).do(automated_job)
+            elif mode == "Hàng tuần": schedule.every().monday.at(run_time).do(automated_job)
+            elif mode == "Hàng tháng": schedule.every(30).days.at(run_time).do(automated_job)
+                
+            st.session_state.last_schedule_config = current_schedule_config
+            logging.info(f"Đã cập nhật lịch trình mới: {current_schedule_config}")
+            
+        next_run = schedule.next_run()
+        if next_run:
+            st.caption(f"⏳ Lần chạy tiếp theo: **{next_run.strftime('%Y-%m-%d %H:%M:%S')}** (Theo giờ Server)")
+        else:
+            st.caption("⏸️ Lịch chạy tự động đang tắt.")
+
+    with st.sidebar.expander("🚀 vnstock (Chứng khoán & Thanh khoản)", expanded=True):
+        if st.button("🚀 Lấy dữ liệu từ vnstock", use_container_width=True):
+            p_bar = st.sidebar.progress(0)
+            s_box = st.sidebar.status("Đang kết nối vnstock...", expanded=True)
+            vn_data = fetch_vnstock_market_data(p_bar, s_box, log_func=st.warning)
+            if vn_data:
+                for k, v in vn_data.items(): st.session_state[k] = v
+                st.sidebar.success("✅ Cập nhật vnstock thành công!")
+                st.rerun()
 
     st.sidebar.markdown("---")
-    with st.sidebar.expander("👤 Thông tin nhà đầu tư & Danh mục hiện tại", expanded=True):
+    with st.sidebar.expander("👤 Thông tin nhà đầu tư", expanded=True):
         st.number_input("Tuổi của bạn", 18, 100, key="age")
-        saa_equity = max(0.0, float(100 - st.session_state.age))
-        saa_gold = 10.0
-        saa_bond = max(0.0, 100.0 - saa_equity - saa_gold)
-
-        st.caption("💼 **Tỷ trọng Thực tế Hiện tại (Để tính Đảo danh mục):**")
-        st.number_input("Tỷ trọng Cổ phiếu Hiện tại (%)", 0.0, 100.0, step=1.0, key="curr_w_equity")
-        st.number_input("Tỷ trọng Trái phiếu Hiện tại (%)", 0.0, 100.0, step=1.0, key="curr_w_bond")
+        st.number_input("Tỷ trọng CP Hiện tại (%)", 0.0, 100.0, step=1.0, key="curr_w_equity")
+        st.number_input("Tỷ trọng TP Hiện tại (%)", 0.0, 100.0, step=1.0, key="curr_w_bond")
         st.number_input("Tỷ trọng Vàng Hiện tại (%)", 0.0, 100.0, step=1.0, key="curr_w_gold")
-        st.number_input("Tổng Quy mô Danh mục NAV (Triệu VND)", 1.0, 1e7, step=10.0, key="portfolio_nav")
+        st.number_input("Quy mô Danh mục (Triệu)", 1.0, 1e7, step=10.0, key="portfolio_nav")
 
-    with st.sidebar.expander("⚖️ Kiểm soát Ma sát Thực thi [NÂNG CẤP 3]", expanded=True):
-        st.number_input("Trần Đảo Danh Mục Max Turnover (%) [mre_vam]", 5.0, 100.0, step=5.0, key="max_turnover",
-                        help="Giới hạn tối đa % danh mục được phép thay đổi trong một lần tái cân bằng")
-        st.number_input("Thuế & Phí Giao dịch Ước tính (%)", 0.0, 2.0, step=0.05, key="fee_rate",
-                        help="Bao gồm phí môi giới, thuế TNCN và trượt giá (mặc định 0.15%)")
+    with st.sidebar.expander("⚖️ Kiểm soát Ma sát Thực thi", expanded=True):
+        st.number_input("Trần Đảo Danh Mục Turnover (%)", 5.0, 100.0, step=5.0, key="max_turnover")
+        st.number_input("Thuế & Phí Giao dịch Ước tính (%)", 0.0, 2.0, step=0.05, key="fee_rate")
 
-    with st.sidebar.expander("📈 Định giá & P/E, P/B, ERP, DY", expanded=False):
+    with st.sidebar.expander("📈 Định giá & P/E, P/B", expanded=False):
         st.number_input("PE hiện tại", 0.01, 200.0, step=0.1, key="pe_current")
         st.number_input("PE min", 0.01, 200.0, step=0.1, key="pe_min")
         st.number_input("PE max", 0.01, 200.0, step=0.1, key="pe_max")
         st.number_input("PB hiện tại", 0.01, 50.0, step=0.05, key="pb_current")
         st.number_input("PB min", 0.01, 50.0, step=0.05, key="pb_min")
         st.number_input("PB max", 0.01, 50.0, step=0.05, key="pb_max")
-        st.number_input("Lãi suất phi rủi ro Rf (%) [Gemini]", 0.0, 30.0, step=0.1, key="rf")
+        st.number_input("Lãi suất phi rủi ro Rf (%)", 0.0, 30.0, step=0.1, key="rf")
         st.number_input("ERP min (%)", -30.0, 30.0, step=0.1, key="erp_min")
         st.number_input("ERP max (%)", -30.0, 30.0, step=0.1, key="erp_max")
         st.number_input("DY hiện tại (%)", 0.0, 30.0, step=0.1, key="dy_current")
         st.number_input("DY min (%)", 0.0, 30.0, step=0.1, key="dy_min")
         st.number_input("DY max (%)", 0.0, 30.0, step=0.1, key="dy_max")
 
-    with st.sidebar.expander("🌐 Vĩ mô Mỹ & Vàng Động [Gemini]", expanded=False):
+    with st.sidebar.expander("🌐 Vĩ mô Mỹ", expanded=False):
         st.number_input("US10Y (%)", 0.0, 20.0, step=0.05, key="us10y")
         st.number_input("Lạm phát CPI Mỹ (%)", -5.0, 30.0, step=0.1, key="us_cpi")
 
     with st.sidebar.expander("🛡️ Chất lượng & Tăng trưởng", expanded=False):
         st.number_input("ROE hiện tại (%)", -50.0, 100.0, step=0.5, key="roe_current")
         st.number_input("ROE chuẩn (%)", 0.0, 100.0, step=0.5, key="roe_benchmark")
-        st.number_input("Tăng trưởng EPS dự phóng (%) [Gemini]", -100.0, 200.0, step=0.5, key="eps_growth_exp")
+        st.number_input("Tăng trưởng EPS dự phóng (%)", -100.0, 200.0, step=0.5, key="eps_growth_exp")
         st.number_input("Tăng trưởng EPS chuẩn (%)", -50.0, 100.0, step=0.5, key="eps_growth_benchmark")
 
-    with st.sidebar.expander("📉 Xu hướng Kỹ thuật & Biến động [vnstock]", expanded=False):
+    with st.sidebar.expander("📉 Kỹ thuật & Biến động", expanded=False):
         st.number_input("VN-Index Giá", 0.0, 1e7, step=1.0, key="price_current")
         st.number_input("VN-Index MA20", 0.0, 1e7, step=1.0, key="ma20")
         st.number_input("VN-Index MA200", 0.0, 1e7, step=1.0, key="ma200")
         st.number_input("Volatility thực tế 1Y (%)", 0.0, 200.0, step=0.5, key="volatility_current")
-        st.number_input("Volatility TB 2Y (%) [vnstock]", 0.0, 200.0, step=0.5, key="volatility_avg")
+        st.number_input("Volatility TB 2Y (%)", 0.0, 200.0, step=0.5, key="volatility_avg")
         st.number_input("Drawdown (%)", 0.0, 100.0, step=0.5, key="drawdown_pct")
 
-    with st.sidebar.expander("💧 Thanh khoản Nội địa VN-FCI [vnstock]", expanded=False):
-        st.number_input("Động lượng Volume MA20/MA200", 0.0, 10.0, step=0.05, key="vol_ratio",
-                        help="> 1.0: Dòng tiền nở rộ; < 0.8: Dòng tiền rút lui")
-        st.number_input("Độ rộng Nhóm Ngân hàng > MA50 (%)", 0.0, 100.0, step=1.0, key="bank_breadth",
-                        help="% cổ phiếu ngân hàng trụ cột giữ vững xu hướng trung hạn")
+    with st.sidebar.expander("💧 Thanh khoản Nội địa", expanded=False):
+        st.number_input("Động lượng Volume MA20/MA200", 0.0, 10.0, step=0.05, key="vol_ratio")
+        st.number_input("Độ rộng Nhóm Ngân hàng (%)", 0.0, 100.0, step=1.0, key="bank_breadth")
 
     st.sidebar.markdown("---")
     st.session_state.investment_notes = st.sidebar.text_area("📝 Ghi chú đầu tư", value=st.session_state.get("investment_notes", ""))
     calc_clicked = st.sidebar.button("🚀 Tính toán phân bổ", use_container_width=True, type="primary")
 
     # ---------------------------------------------------------------------------
-    # Màn hình chính
+    # TÍNH TOÁN (UI Chính)
     # ---------------------------------------------------------------------------
     st.title("📊 VAM Multi-Asset Allocator & HMM Market Clock")
 
     if calc_clicked:
+        saa_equity = max(0.0, float(100 - st.session_state.age))
+        saa_bond = max(0.0, 100.0 - saa_equity - 10.0)
         inputs = VAMInputs(
-            age=int(st.session_state.age),
-            saa_equity=saa_equity, saa_gold=saa_gold, saa_bond=saa_bond,
-            pe_current=float(st.session_state.pe_current), pe_min=float(st.session_state.pe_min), pe_max=float(st.session_state.pe_max),
-            pb_current=float(st.session_state.pb_current), pb_min=float(st.session_state.pb_min), pb_max=float(st.session_state.pb_max),
-            rf=float(st.session_state.rf), erp_min=float(st.session_state.erp_min), erp_max=float(st.session_state.erp_max),
-            dy_current=float(st.session_state.dy_current), dy_min=float(st.session_state.dy_min), dy_max=float(st.session_state.dy_max),
-            w_pe=float(st.session_state.w_pe), w_pb=float(st.session_state.w_pb),
-            w_erp=float(st.session_state.w_erp), w_dy=float(st.session_state.w_dy),
-            roe_current=float(st.session_state.roe_current), roe_benchmark=float(st.session_state.roe_benchmark),
-            eps_growth_exp=float(st.session_state.eps_growth_exp), eps_growth_benchmark=float(st.session_state.eps_growth_benchmark),
-            price_current=float(st.session_state.price_current), ma200=float(st.session_state.ma200),
-            volatility_current=float(st.session_state.volatility_current), volatility_avg=float(st.session_state.volatility_avg),
-            drawdown_pct=float(st.session_state.drawdown_pct),
-            us10y=float(st.session_state.us10y), us_cpi=float(st.session_state.us_cpi),
+            age=int(st.session_state.age), saa_equity=saa_equity, saa_gold=10.0, saa_bond=saa_bond,
+            pe_current=st.session_state.pe_current, pe_min=st.session_state.pe_min, pe_max=st.session_state.pe_max,
+            pb_current=st.session_state.pb_current, pb_min=st.session_state.pb_min, pb_max=st.session_state.pb_max,
+            rf=st.session_state.rf, erp_min=st.session_state.erp_min, erp_max=st.session_state.erp_max,
+            dy_current=st.session_state.dy_current, dy_min=st.session_state.dy_min, dy_max=st.session_state.dy_max,
+            w_pe=st.session_state.w_pe, w_pb=st.session_state.w_pb, w_erp=st.session_state.w_erp, w_dy=st.session_state.w_dy,
+            roe_current=st.session_state.roe_current, roe_benchmark=st.session_state.roe_benchmark,
+            eps_growth_exp=st.session_state.eps_growth_exp, eps_growth_benchmark=st.session_state.eps_growth_benchmark,
+            price_current=st.session_state.price_current, ma200=st.session_state.ma200,
+            volatility_current=st.session_state.volatility_current, volatility_avg=st.session_state.volatility_avg,
+            drawdown_pct=st.session_state.drawdown_pct, us10y=st.session_state.us10y, us_cpi=st.session_state.us_cpi,
             method=st.session_state.method,
         )
         result = compute(inputs)
@@ -740,48 +817,30 @@ def render():
         st.session_state.last_inputs = inputs
 
         if SHEETS_ON:
-            try:
-                row = make_log_row(inputs, result, st.session_state.investment_notes)
-                append_log_row(row)
-                st.toast("✅ Đã lưu Google Sheets!", icon="💾")
-            except Exception as exc:
-                st.warning(f"⚠️ Chưa ghi log Sheets: {exc}")
+            try: append_log_row(make_log_row(inputs, result, st.session_state.investment_notes)); st.toast("✅ Đã lưu Google Sheets!")
+            except Exception as exc: st.warning(f"⚠️ Chưa ghi log Sheets: {exc}")
         else:
-            st.session_state.log.append({
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "note": st.session_state.investment_notes,
-                "valuation_score": result.valuation_score,
-                "equity_weight": result.equity_weight,
-                "bond_weight": result.bond_weight,
-                "gold_weight": result.gold_weight,
-            })
-            st.toast("ℹ️ Đã lưu tạm phiên làm việc.", icon="📝")
+            st.session_state.log.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "note": st.session_state.investment_notes, "valuation_score": result.valuation_score, "equity_weight": result.equity_weight, "bond_weight": result.bond_weight, "gold_weight": result.gold_weight})
 
     result = st.session_state.get("last_result")
     inputs = st.session_state.get("last_inputs")
 
-    if result is None:
-        st.info('👈 Nhập thông số hoặc bấm "🚀 Tính toán phân bổ" ở thanh bên trái.')
+    if not result:
+        st.info("👈 Bấm 'Tính toán phân bổ' ở thanh bên trái.")
         return
 
-    # ---------------------------------------------------------------------------
-    # TÍNH TOÁN & HIỂN THỊ ĐỒNG HỒ CHU KỲ (HMM + VN-FCI ENGINE)
-    # ---------------------------------------------------------------------------
     ma20_curr = float(st.session_state.get("ma20", inputs.ma200))
-    clock_data = calculate_hmm_market_clock(inputs, ma20_curr)
-    probs = clock_data["probabilities"]
-
+    vol_r = float(st.session_state.get("vol_ratio", 1.0))
+    bank_b = float(st.session_state.get("bank_breadth", 50.0))
+    clock_data = calculate_hmm_market_clock(inputs, ma20_curr, vol_r, bank_b)
+    
     st.markdown(
         f"""
         <div style="background-color: #0F172A; border-left: 6px solid #38BDF8; padding: 16px 20px; border-radius: 8px; margin-bottom: 20px;">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
                 <div>
-                    <div style="font-size: 0.85rem; text-transform: uppercase; color: #94A3B8; font-weight: 600;">
-                        🕰️ ĐỒNG HỒ CHU KỲ HMM & THANH KHOẢN VN-FCI
-                    </div>
-                    <div style="font-size: 1.45rem; font-weight: 700; color: #F8FAFC; margin-top: 4px;">
-                        {clock_data['phase']}
-                    </div>
+                    <div style="font-size: 0.85rem; text-transform: uppercase; color: #94A3B8; font-weight: 600;">🕰️ ĐỒNG HỒ CHU KỲ HMM & THANH KHOẢN VN-FCI</div>
+                    <div style="font-size: 1.45rem; font-weight: 700; color: #F8FAFC; margin-top: 4px;">{clock_data['phase']}</div>
                 </div>
                 <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                     <div style="background: #1E293B; padding: 8px 14px; border-radius: 6px; border: 1px solid #334155; text-align: center;">
@@ -794,102 +853,37 @@ def render():
                     </div>
                 </div>
             </div>
-            <div style="font-size: 0.95rem; color: #CBD5E1; line-height: 1.5; margin-top: 10px;">
-                📌 <b>Trạng thái:</b> {clock_data['desc']}<br>
-                💡 <b>Hành động:</b> {clock_data['bias']}
-            </div>
+            <div style="font-size: 0.95rem; color: #CBD5E1; line-height: 1.5; margin-top: 10px;">📌 <b>Trạng thái:</b> {clock_data['desc']}<br>💡 <b>Hành động:</b> {clock_data['bias']}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # ---------------------------------------------------------------------------
-    # NÂNG CẤP 3: Tính toán Thực thi (Execution Friction & Turnover Cap)
-    # ---------------------------------------------------------------------------
-    raw_w = {"equity": result.equity_weight, "bond": result.bond_weight, "gold": result.gold_weight}
-    curr_w = {
-        "equity": float(st.session_state.get("curr_w_equity", 60.0)),
-        "bond": float(st.session_state.get("curr_w_bond", 25.0)),
-        "gold": float(st.session_state.get("curr_w_gold", 15.0)),
-    }
+    curr_w = {"equity": st.session_state.curr_w_equity, "bond": st.session_state.curr_w_bond, "gold": st.session_state.curr_w_gold}
     curr_sum = sum(curr_w.values())
-    if curr_sum > 0:
-        curr_w = {k: (v / curr_sum) * 100.0 for k, v in curr_w.items()}
+    if curr_sum > 0: curr_w = {k: (v / curr_sum) * 100.0 for k, v in curr_w.items()}
 
-    frict_res = calculate_execution_friction(
-        raw_weights=raw_w,
-        curr_weights=curr_w,
-        max_turnover_pct=float(st.session_state.get("max_turnover", 25.0)),
-        fee_rate_pct=float(st.session_state.get("fee_rate", 0.15)),
-        portfolio_nav_mil=float(st.session_state.get("portfolio_nav", 1000.0)),
-    )
+    frict_res = calculate_execution_friction({"equity": result.equity_weight, "bond": result.bond_weight, "gold": result.gold_weight}, curr_w, st.session_state.max_turnover, st.session_state.fee_rate, st.session_state.portfolio_nav)
     exec_w = frict_res["exec_weights"]
 
-    c_graph1, c_graph2 = st.columns([1, 1])
-
-    with c_graph1:
+    c1, c2 = st.columns(2)
+    with c1:
         st.subheader("🕒 Đồng hồ Chu kỳ HMM")
-        fig_clock = draw_market_clock_chart(clock_data["hour"])
-        st.plotly_chart(fig_clock, use_container_width=True, config={"responsive": True})
-
-        st.markdown(
-            f"""
-            <div style="margin-top: 10px;">
-                <div style="font-size: 0.85rem; color: #94A3B8; font-weight: 600; margin-bottom: 6px;">
-                    📊 Phân phối xác suất 4 Pha Chu kỳ Vĩ mô (HMM Soft Probabilities):
-                </div>
-                <div style="display: flex; flex-wrap: wrap; gap: 8px; width: 100%;">
-                    <div class="prob-card">
-                        <div class="prob-title">🟢 Tích lũy (6h)</div>
-                        <div class="prob-value" style="color: #4ADE80;">{probs['Recovery']*100:.1f}%</div>
-                    </div>
-                    <div class="prob-card">
-                        <div class="prob-title">🔵 Tăng trưởng (9h)</div>
-                        <div class="prob-value" style="color: #60A5FA;">{probs['Expansion']*100:.1f}%</div>
-                    </div>
-                    <div class="prob-card">
-                        <div class="prob-title">🟡 Phân phối (12h)</div>
-                        <div class="prob-value" style="color: #FACC15;">{probs['Slowdown']*100:.1f}%</div>
-                    </div>
-                    <div class="prob-card">
-                        <div class="prob-title">🔴 Suy thoái (3h)</div>
-                        <div class="prob-value" style="color: #F87171;">{probs['Recession']*100:.1f}%</div>
-                    </div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with c_graph2:
+        st.plotly_chart(draw_market_clock_chart(clock_data["hour"]), use_container_width=True)
+    with c2:
         st.subheader("📈 Tỷ trọng Thực thi (Turnover Capped)")
-        weights_exec = [exec_w["equity"], exec_w["bond"], exec_w["gold"]]
-        labels = ["Cổ phiếu", "Trái phiếu", "Vàng"]
-        colors = ["#2563EB", "#F59E0B", "#10B981"]
-        fig_pie = draw_plotly_pie_chart(weights_exec, labels, colors, center_text="EXECUTABLE")
-        st.plotly_chart(fig_pie, use_container_width=True, config={"responsive": True})
+        st.plotly_chart(draw_plotly_pie_chart([exec_w["equity"], exec_w["bond"], exec_w["gold"]], ["Cổ phiếu", "Trái phiếu", "Vàng"], ["#2563EB", "#F59E0B", "#10B981"], "EXECUTABLE"), use_container_width=True)
 
-    # ---------------------------------------------------------------------------
-    # Thẻ Đo lường Ma sát & Chi phí Thực thi (Turnover & Cost Dashboard)
-    # ---------------------------------------------------------------------------
     st.markdown("---")
     st.subheader("⚖️ Bảng Thực thi & Kiểm soát Ma sát Đảo danh mục (Turnover Safeguard)")
+    c_t1, c_t2, c_t3, c_t4 = st.columns(4)
+    c_t1.metric("Đảo danh mục", f"{frict_res['actual_turnover']:.1f}%", delta=f"Lý thuyết: {frict_res['raw_turnover']:.1f}%", delta_color="inverse")
+    c_t2.metric("Giá trị Luân chuyển", f"{frict_res['money_turnover']:.1f} Tr VND")
+    c_t3.metric("Chi phí Ma sát Ước tính", f"{frict_res['est_fee_cost']*1e6:,.0f} VND")
+    c_t4.metric("Lệnh Khuyến nghị", "Thực thi" if frict_res['action_needed'] else "Nắm giữ (Hold)")
 
-    col_t1, col_t2, col_t3, col_t4 = st.columns(4)
-    col_t1.metric("Đảo danh mục Dự kiến", f"{frict_res['actual_turnover']:.1f}%",
-                  delta=f"Lý thuyết: {frict_res['raw_turnover']:.1f}%", delta_color="inverse")
-    col_t2.metric("Giá trị Luân chuyển", f"{frict_res['money_turnover']:.1f} Tr VND")
-    col_t3.metric("Chi phí Ma sát Ước tính", f"{frict_res['est_fee_cost']*1e6:,.0f} VND",
-                  help=f"Tính theo mức thuế phí {st.session_state.fee_rate}%")
-    col_t4.metric("Lệnh Khuyến nghị", "Thực thi" if frict_res['action_needed'] else "Nắm giữ (Hold)")
-
-    if frict_res['action_needed']:
-        st.info(f"💡 **Trạng thái thực thi:** {frict_res['status']}. "
-                f"Tỷ trọng khuyến nghị điều chỉnh: **Cổ phiếu {exec_w['equity']:.1f}%** | "
-                f"**Trái phiếu {exec_w['bond']:.1f}%** | **Vàng {exec_w['gold']:.1f}%**.")
-    else:
-        st.success(f"✅ **Trạng thái thực thi:** {frict_res['status']}. "
-                   f"Lợi ích điều chỉnh không bù đắp được chi phí ma sát và trượt giá. Danh mục được khuyến nghị giữ nguyên trạng thái.")
+    if frict_res['action_needed']: st.info(f"💡 **Thực thi:** {frict_res['status']}. CP {exec_w['equity']:.1f}% | TP {exec_w['bond']:.1f}% | Vàng {exec_w['gold']:.1f}%.")
+    else: st.success(f"✅ **Thực thi:** {frict_res['status']}. Khuyến nghị giữ nguyên trạng thái.")
 
     st.markdown("---")
     m1, m2, m3, m4, m5 = st.columns([1.2, 1, 1, 1, 1])
@@ -900,59 +894,29 @@ def render():
     m5.metric("Rút vốn/năm", f"{result.withdrawal_rate:.1f}%")
 
     rec = getattr(result, "recommendation", {})
-    action = rec.get("action", "")
-    headline = rec.get("headline", "")
-    detail = rec.get("detail", "")
-    rule_text = getattr(result, "rule_text", "")
-    st.info(f"**⚖️ Quy tắc:** {rule_text}\n\n**📢 Hành động:** `{action}` - **{headline}**\n\n**📝 Chi tiết:** {detail}")
+    st.info(f"**⚖️ Quy tắc:** {getattr(result, 'rule_text', '')}\n\n**📢 Hành động:** `{rec.get('action', '')}` - **{rec.get('headline', '')}**\n\n**📝 Chi tiết:** {rec.get('detail', '')}")
 
     tab1, tab2 = st.tabs(["🔍 Bảng So sánh Tỷ trọng & Chi tiết Chỉ số", "📜 Lịch sử lưu Google Sheets"])
-
     with tab1:
-        st.markdown("**1. Bảng So sánh Tỷ trọng: Hiện tại vs Lý thuyết VAM vs Thực thi Capped**")
-        df_weights_compare = pd.DataFrame([
-            {
-                "Tài sản": "Cổ phiếu",
-                "Hiện tại (%)": f"{curr_w['equity']:.1f}%",
-                "Mục tiêu Lý thuyết (%)": f"{result.equity_weight:.1f}%",
-                "Thực thi Capped (%)": f"{exec_w['equity']:.1f}%",
-                "Thay đổi Thực thi (%)": f"{exec_w['equity'] - curr_w['equity']:+.1f}%"
-            },
-            {
-                "Tài sản": "Trái phiếu",
-                "Hiện tại (%)": f"{curr_w['bond']:.1f}%",
-                "Mục tiêu Lý thuyết (%)": f"{result.bond_weight:.1f}%",
-                "Thực thi Capped (%)": f"{exec_w['bond']:.1f}%",
-                "Thay đổi Thực thi (%)": f"{exec_w['bond'] - curr_w['bond']:+.1f}%"
-            },
-            {
-                "Tài sản": "Vàng",
-                "Hiện tại (%)": f"{curr_w['gold']:.1f}%",
-                "Mục tiêu Lý thuyết (%)": f"{result.gold_weight:.1f}%",
-                "Thực thi Capped (%)": f"{exec_w['gold']:.1f}%",
-                "Thay đổi Thực thi (%)": f"{exec_w['gold'] - curr_w['gold']:+.1f}%"
-            },
+        st.markdown("**1. Bảng So sánh Tỷ trọng**")
+        df_comp = pd.DataFrame([
+            {"Tài sản": "Cổ phiếu", "Hiện tại (%)": f"{curr_w['equity']:.1f}%", "Mục tiêu (%)": f"{result.equity_weight:.1f}%", "Thực thi (%)": f"{exec_w['equity']:.1f}%", "Độ lệch": f"{exec_w['equity'] - curr_w['equity']:+.1f}%"},
+            {"Tài sản": "Trái phiếu", "Hiện tại (%)": f"{curr_w['bond']:.1f}%", "Mục tiêu (%)": f"{result.bond_weight:.1f}%", "Thực thi (%)": f"{exec_w['bond']:.1f}%", "Độ lệch": f"{exec_w['bond'] - curr_w['bond']:+.1f}%"},
+            {"Tài sản": "Vàng", "Hiện tại (%)": f"{curr_w['gold']:.1f}%", "Mục tiêu (%)": f"{result.gold_weight:.1f}%", "Thực thi (%)": f"{exec_w['gold']:.1f}%", "Độ lệch": f"{exec_w['gold'] - curr_w['gold']:+.1f}%"},
         ])
-        st.dataframe(df_weights_compare, use_container_width=True, hide_index=True)
-
+        st.dataframe(df_comp, use_container_width=True, hide_index=True)
         st.markdown("**2. Bảng Đánh giá Các Chỉ số Đầu vào & Thanh khoản**")
-        detail_data = [
+        st.dataframe(pd.DataFrame([
             {"Chỉ số": "Vị thế Giờ HMM", "Giá trị": f"{clock_data['time_str']}", "Pha": clock_data['phase'], "Nhận xét": clock_data['desc']},
-            {"Chỉ số": "Thanh khoản VN-FCI", "Giá trị": f"Score: {clock_data['fci_score']:+.2f}", "Pha": clock_data['fci_state'], "Nhận xét": "Đo lường mức độ nới lỏng dòng tiền và sức khỏe nhóm cổ phiếu Ngân hàng."},
-            {"Chỉ số": "Động lượng Volume", "Giá trị": f"{st.session_state.get('vol_ratio', 1.0):.2f}x", "Pha": "Vol MA20 / MA200", "Nhận xét": "Tốc độ giãn nở thanh khoản giao dịch so với trung bình 1 năm."},
-            {"Chỉ số": "Độ rộng Ngân hàng", "Giá trị": f"{st.session_state.get('bank_breadth', 50.0):.1f}%", "Pha": "% Cổ phiếu > MA50", "Nhận xét": "Tỷ lệ cổ phiếu ngân hàng duy trì xu hướng tăng trung hạn."},
+            {"Chỉ số": "Thanh khoản VN-FCI", "Giá trị": f"Score: {clock_data['fci_score']:+.2f}", "Pha": clock_data['fci_state'], "Nhận xét": "Đo lường mức độ nới lỏng dòng tiền."},
+            {"Chỉ số": "Động lượng Volume", "Giá trị": f"{st.session_state.get('vol_ratio', 1.0):.2f}x", "Pha": "Vol MA20 / MA200", "Nhận xét": "Tốc độ giãn nở thanh khoản giao dịch."},
+            {"Chỉ số": "Độ rộng Ngân hàng", "Giá trị": f"{st.session_state.get('bank_breadth', 50.0):.1f}%", "Pha": "% Cổ phiếu > MA50", "Nhận xét": "Tỷ lệ CP ngân hàng duy trì xu hướng."},
             {"Chỉ số": "P/E", "Giá trị": f"{inputs.pe_current:.2f}", "Pha": f"Min: {inputs.pe_min} - Max: {inputs.pe_max}", "Nhận xét": "Vùng định giá theo lợi nhuận rổ VN30."},
-            {"Chỉ số": "P/B", "Giá trị": f"{inputs.pb_current:.2f}", "Pha": f"Min: {inputs.pb_min} - Max: {inputs.pb_max}", "Nhận xét": "Vùng định giá theo giá trị sổ sách."},
-            {"Chỉ số": "Kỹ thuật Đa tầng", "Giá trị": f"Giá: {inputs.price_current:.1f} | MA20: {ma20_curr:.1f}", "Pha": f"MA200: {inputs.ma200:.1f}", "Nhận xét": "Cấu trúc dòng tiền ngắn hạn và xu hướng dài hạn."}
-        ]
-        st.dataframe(pd.DataFrame(detail_data), use_container_width=True, hide_index=True)
-
+            {"Chỉ số": "Kỹ thuật Đa tầng", "Giá trị": f"Giá: {inputs.price_current:.1f} | MA20: {ma20_curr:.1f}", "Pha": f"MA200: {inputs.ma200:.1f}", "Nhận xét": "Cấu trúc dòng tiền."}
+        ]), use_container_width=True, hide_index=True)
     with tab2:
         try:
             df_logs = load_log_df() if SHEETS_ON else pd.DataFrame(st.session_state.log)
-            if not df_logs.empty:
-                st.dataframe(df_logs, use_container_width=True, hide_index=True)
-            else:
-                st.info("Chưa có bản ghi lịch sử nào.")
-        except Exception as exc:
-            st.error(f"Lỗi tải logs: {exc}")
+            if not df_logs.empty: st.dataframe(df_logs, use_container_width=True, hide_index=True)
+            else: st.info("Chưa có bản ghi lịch sử nào.")
+        except Exception as exc: st.error(f"Lỗi tải logs: {exc}")
