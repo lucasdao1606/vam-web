@@ -6,3 +6,5 @@ google-auth>=2.30
 plotly>=5.0.0
 vnstock>=4.0.0
 google-genai
+schedule>=1.2.0
+cryptography>=41.0.0
