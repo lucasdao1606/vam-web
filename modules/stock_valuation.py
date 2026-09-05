@@ -14,6 +14,7 @@ Tích hợp:
 - NÂNG CẤP 10: Tự động Forward tin nhắn từ Admin lên Public Channel
 - NÂNG CẤP 11: Tự động lưu trữ và đồng bộ vào stock_database.csv
 - NÂNG CẤP 12: Bộ Scheduler độc lập (stock_scheduler) chống xung đột
+- NÂNG CẤP 13: Tự động Git Commit & Push file stock_database.csv lên GitHub
 - FIX BUG: Sửa lỗi TypeError stock_scheduler.next_run (chuyển method -> property)
 """
 
@@ -22,6 +23,7 @@ import re
 import time
 import os
 import math
+import subprocess
 from datetime import datetime, date, timedelta, timezone
 import threading
 import schedule
@@ -49,6 +51,30 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     encoding='utf-8'
 )
+
+# ---------------------------------------------------------------------------
+# HÀM TỰ ĐỘNG GIT COMMIT & PUSH (NON-BLOCKING BACKGROUND THREAD)
+# ---------------------------------------------------------------------------
+def git_auto_commit_push(file_path: str, commit_message: str):
+    def _task():
+        try:
+            # 1. Thêm chỉ định duy nhất file database
+            subprocess.run(["git", "add", "-f", file_path], check=True, capture_output=True, text=True)
+            # 2. Commit nếu có thay đổi mới
+            res = subprocess.run(["git", "commit", "-m", commit_message], capture_output=True, text=True)
+            if "nothing to commit" in res.stdout or "nothing to commit" in res.stderr:
+                logging.info(f"[GIT AUTO-SYNC] {file_path}: Không có thay đổi mới để commit.")
+                return
+            # 3. Push lên repository
+            subprocess.run(["git", "push", "origin", "main"], check=True, capture_output=True, text=True)
+            logging.info(f"[GIT AUTO-SYNC] {file_path}: Đã đẩy dữ liệu mới lên GitHub thành công.")
+        except subprocess.CalledProcessError as e:
+            logging.error(f"[GIT AUTO-SYNC] Lỗi Git lệnh: {e.stderr or e.stdout}")
+        except Exception as ex:
+            logging.error(f"[GIT AUTO-SYNC] Lỗi không xác định: {ex}")
+
+    th = threading.Thread(target=_task, daemon=True)
+    th.start()
 
 # ---------------------------------------------------------------------------
 # CƠ CHẾ BẢO MẬT & MÃ HÓA (SECURITY VAULT)
@@ -106,7 +132,10 @@ def load_secure_vault() -> dict:
         logging.error(f"Lỗi giải mã: {e}")
         return {}
 
-SENSITIVE_KEYS = {"gemini_api_key", "telegram_token", "telegram_chat_id", "telegram_channel_id"}
+SENSITIVE_KEYS = {
+    "gemini_api_key", "telegram_token", "telegram_chat_id", "telegram_channel_id",
+    "schedule_mode", "schedule_time", "crypto_schedule_mode", "crypto_schedule_time"
+}
 GLOBAL_CONFIG = {}
 
 # ---------------------------------------------------------------------------
@@ -185,6 +214,9 @@ def save_stock_database(inputs: VAMInputs, result, frict_res: dict, clock_data: 
             df_new.to_csv(db_path, mode="w", index=False, encoding="utf-8-sig")
         else:
             df_new.to_csv(db_path, mode="a", header=False, index=False, encoding="utf-8-sig")
+
+        # TỰ ĐỘNG GIT COMMIT & PUSH LÊN GITHUB
+        git_auto_commit_push(db_path, f"data(stock): Auto-record VAM analysis {ts_local}")
         return True
     except PermissionError:
         logging.warning(f"File {db_path} đang mở trong ứng dụng khác.")
@@ -614,8 +646,9 @@ def render():
 
     SHEETS_ON = sheets_configured()
 
+    vault_data = load_secure_vault()
     if "vault_loaded" not in st.session_state:
-        st.session_state.update(load_secure_vault())
+        st.session_state.update(vault_data)
         st.session_state.vault_loaded = True
 
     global DEFAULTS
@@ -639,8 +672,8 @@ def render():
         "telegram_token": get_secret("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": get_secret("TELEGRAM_CHAT_ID", ""),
         "telegram_channel_id": get_secret("TELEGRAM_CHANNEL_ID", ""),
-        "schedule_mode": "Không",
-        "schedule_time": "08:00",
+        "schedule_mode": vault_data.get("schedule_mode", "Không"),
+        "schedule_time": vault_data.get("schedule_time", "08:00"),
         "telegram_notify_mode": "Luôn gửi",
     }
 
@@ -807,7 +840,13 @@ def render():
             st.session_state.last_schedule_config = current_schedule_config
             logging.info(f"Đã cập nhật lịch trình mới: {current_schedule_config}")
             
-        # SỬA LỖI TẠI ĐÂY: Dùng thuộc tính next_run thay vì gọi hàm next_run()
+            # TỰ ĐỘNG LƯU VÀO VAULT KHI THAY ĐỔI
+            if CRYPTO_ENABLED:
+                current_vault = load_secure_vault()
+                current_vault["schedule_mode"] = mode
+                current_vault["schedule_time"] = run_time
+                save_secure_vault(current_vault)
+
         next_run = getattr(stock_scheduler, "next_run", None)
         if callable(next_run):
             try: next_run = next_run()

@@ -6,6 +6,7 @@ Tích hợp:
 - Lập lịch tự động gửi báo cáo Telegram & Forward Channel
 - Tự động đồng bộ và lưu trữ toàn bộ tham số vào crypto_database.csv
 - Bộ Scheduler độc lập (crypto_scheduler) chống xung đột
+- NÂNG CẤP MỚI: Tự động Git Commit & Push file crypto_database.csv lên GitHub
 - Tab tra cứu, lọc lịch sử và nút Download file CSV tiện lợi
 """
 
@@ -16,6 +17,7 @@ import threading
 import schedule
 import logging
 import requests
+import subprocess
 from datetime import datetime
 
 import pandas as pd
@@ -36,6 +38,7 @@ from modules.stock_valuation import (
     save_secure_vault,
     send_telegram_msg,
     forward_telegram_msg,
+    git_auto_commit_push,
     SENSITIVE_KEYS,
     CRYPTO_ENABLED,
     GLOBAL_CONFIG as STOCK_GLOBAL_CONFIG
@@ -105,7 +108,6 @@ def build_crypto_telegram_message(data: dict, current_portfolio: dict) -> str:
     msg += f"- <b>Lưu lượng On-chain:</b> {data['onchain']['eth_tx_count']:,} txs | {data['onchain']['eth_active_addresses']:,} addrs (5 blocks)\n\n"
 
     # BLOCK 4: THỰC THI TÁI CÂN BẰNG DANH MỤC
-    msg += "⚖️ <b>THỰC THI TÁI CÂN BẰNG DANH MỤC (BANDWIDTH ±5%)</b>\n"
     has_action = False
     for asset in ["BTC", "Altcoins (Top 5 Market Cap)", "PAXG", "USDT"]:
         tgt = alloc[asset]
@@ -143,6 +145,9 @@ def automated_crypto_job():
 
     try:
         data = run_vam_analysis(log_func=logging.info, auto_save=True)
+        # Kích hoạt tự động đẩy file crypto_database.csv lên GitHub
+        git_auto_commit_push(CRYPTO_DB_FILE, f"data(crypto): Auto-record Crypto VAM metrics {data.get('timestamp_local')}")
+
         curr_port = {
             "BTC": float(CRYPTO_GLOBAL_CONFIG.get("crypto_curr_w_btc", 25.0)) / 100.0,
             "Altcoins (Top 5 Market Cap)": float(CRYPTO_GLOBAL_CONFIG.get("crypto_curr_w_alt", 25.0)) / 100.0,
@@ -204,8 +209,8 @@ def render():
         "crypto_curr_w_alt": 25.0,
         "crypto_curr_w_paxg": 10.0,
         "crypto_curr_w_usdt": 40.0,
-        "crypto_schedule_mode": "Không",
-        "crypto_schedule_time": "08:30"
+        "crypto_schedule_mode": vault_data.get("crypto_schedule_mode", "Không"),
+        "crypto_schedule_time": vault_data.get("crypto_schedule_time", "08:30")
     }
     for k, v in common_keys.items():
         if k not in st.session_state:
@@ -289,6 +294,13 @@ def render():
                 crypto_scheduler.every(30).days.at(t).do(automated_crypto_job)
             st.session_state.last_crypto_schedule_cfg = cfg_key
 
+            # TỰ ĐỘNG LƯU VÀO VAULT KHI THAY ĐỔI LỊCH CRYPTO
+            if CRYPTO_ENABLED:
+                current_vault = load_secure_vault()
+                current_vault["crypto_schedule_mode"] = m
+                current_vault["crypto_schedule_time"] = t
+                save_secure_vault(current_vault)
+
         c_btn1, c_btn2 = st.columns(2)
         with c_btn1:
             if st.button("Kiểm tra Bot", use_container_width=True):
@@ -325,6 +337,7 @@ def render():
         with st.spinner("Đang quét On-chain RPC Pool, Binance Spot/Futures và CoinGecko Market Cap..."):
             try:
                 st.session_state.last_crypto_data = run_vam_analysis(log_func=st.write, auto_save=True)
+                git_auto_commit_push(CRYPTO_DB_FILE, f"data(crypto): Manual analysis sync {st.session_state.last_crypto_data.get('timestamp_local')}")
                 st.toast("✅ Đã cập nhật & đồng bộ dữ liệu vào crypto_database.csv!", icon="💾")
             except Exception as e:
                 st.error(f"Lỗi phân tích: {e}")
